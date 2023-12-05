@@ -125,9 +125,8 @@ func (project *Project) DeleteBucket(ctx context.Context, bucket string) (delete
 		return nil, convertKnownErrors(err, bucket, "")
 	}
 
-	// TODO add IsZero to storj.Bucket implementation
-	if existing.ID.IsZero() && len(existing.Name) == 0 {
-		return nil, nil
+	if len(existing.Name) == 0 {
+		return &Bucket{Name: bucket}, nil
 	}
 
 	return &Bucket{
@@ -151,9 +150,8 @@ func (project *Project) DeleteBucketWithObjects(ctx context.Context, bucket stri
 		return nil, convertKnownErrors(err, bucket, "")
 	}
 
-	// TODO add IsZero to storj.Bucket implementation
-	if existing.ID.IsZero() && len(existing.Name) == 0 {
-		return nil, nil
+	if len(existing.Name) == 0 {
+		return &Bucket{Name: bucket}, nil
 	}
 
 	return &Bucket{

@@ -9,12 +9,19 @@ users of the library that are not required to be backward compatible.
 
 ## Usage
 
-#### func  GetStreamTerm
+#### func  GetStreamFin
 
 ```go
-func GetStreamTerm(opts *Stream) chan<- struct{}
+func GetStreamFin(opts *Stream) chan<- struct{}
 ```
-GetStreamTerm returns the chan<- struct{} stored in the options.
+GetStreamFin returns the chan<- struct{} stored in the options.
+
+#### func  GetStreamKind
+
+```go
+func GetStreamKind(opts *Stream) string
+```
+GetStreamKind returns the kind debug string stored in the options.
 
 #### func  GetStreamTransport
 
@@ -23,12 +30,19 @@ func GetStreamTransport(opts *Stream) drpc.Transport
 ```
 GetStreamTransport returns the drpc.Transport stored in the options.
 
-#### func  SetStreamTerm
+#### func  SetStreamFin
 
 ```go
-func SetStreamTerm(opts *Stream, term chan<- struct{})
+func SetStreamFin(opts *Stream, fin chan<- struct{})
 ```
-SetStreamTerm sets the chan<- struct{} stored in the options.
+SetStreamFin sets the chan<- struct{} stored in the options.
+
+#### func  SetStreamKind
+
+```go
+func SetStreamKind(opts *Stream, kind string)
+```
+SetStreamKind sets the kind debug string stored in the options.
 
 #### func  SetStreamTransport
 

@@ -59,7 +59,7 @@ func DialNodeURL(ctx context.Context, dialer rpc.Dialer, nodeURL string, apiKey 
 		return nil, Error.New("node ID is required in node URL %q", nodeURL)
 	}
 
-	conn, err := dialer.DialNodeURL(ctx, url)
+	conn, err := dialer.DialNode(ctx, url, rpc.DialOptions{ForceTCPFastOpenMultidialSupport: true})
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}
@@ -162,7 +162,7 @@ func (client *Client) CreateBucket(ctx context.Context, params CreateBucketParam
 	return respBucket, nil
 }
 
-// GetBucketParams parmaters for GetBucketParams method.
+// GetBucketParams parameters for GetBucketParams method.
 type GetBucketParams struct {
 	Name []byte
 }
@@ -222,7 +222,51 @@ func (client *Client) GetBucket(ctx context.Context, params GetBucketParams) (re
 	return respBucket, nil
 }
 
-// DeleteBucketParams parmaters for DeleteBucket method.
+// GetBucketLocationParams parameters for GetBucketLocation method.
+type GetBucketLocationParams struct {
+	Name []byte
+}
+
+func (params *GetBucketLocationParams) toRequest(header *pb.RequestHeader) *pb.GetBucketLocationRequest {
+	return &pb.GetBucketLocationRequest{
+		Header: header,
+		Name:   params.Name,
+	}
+}
+
+// BatchItem returns single item for batch request.
+func (params *GetBucketLocationParams) BatchItem() *pb.BatchRequestItem {
+	return &pb.BatchRequestItem{
+		Request: &pb.BatchRequestItem_BucketGetLocation{
+			BucketGetLocation: params.toRequest(nil),
+		},
+	}
+}
+
+// GetBucketLocationResponse response for GetBucketLocation request.
+type GetBucketLocationResponse struct {
+	Location []byte
+}
+
+// GetBucketLocation returns a bucket location.
+func (client *Client) GetBucketLocation(ctx context.Context, params GetBucketLocationParams) (_ GetBucketLocationResponse, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	var response *pb.GetBucketLocationResponse
+	err = WithRetry(ctx, func(ctx context.Context) error {
+		response, err = client.client.GetBucketLocation(ctx, params.toRequest(client.header()))
+		return err
+	})
+	if err != nil {
+		return GetBucketLocationResponse{}, Error.Wrap(err)
+	}
+
+	return GetBucketLocationResponse{
+		Location: response.Location,
+	}, nil
+}
+
+// DeleteBucketParams parameters for DeleteBucket method.
 type DeleteBucketParams struct {
 	Name      []byte
 	DeleteAll bool
@@ -269,7 +313,7 @@ func (client *Client) DeleteBucket(ctx context.Context, params DeleteBucketParam
 	return respBucket, nil
 }
 
-// ListBucketsParams parmaters for ListBucketsParams method.
+// ListBucketsParams parameters for ListBucketsParams method.
 type ListBucketsParams struct {
 	ListOpts BucketListOptions
 }
@@ -279,7 +323,7 @@ func (params *ListBucketsParams) toRequest(header *pb.RequestHeader) *pb.BucketL
 		Header:    header,
 		Cursor:    []byte(params.ListOpts.Cursor),
 		Limit:     int32(params.ListOpts.Limit),
-		Direction: int32(params.ListOpts.Direction),
+		Direction: params.ListOpts.Direction,
 	}
 }
 
@@ -332,8 +376,9 @@ func (client *Client) ListBuckets(ctx context.Context, params ListBucketsParams)
 	resultBucketList.Items = make([]Bucket, len(response.GetItems()))
 	for i, item := range response.GetItems() {
 		resultBucketList.Items[i] = Bucket{
-			Name:    string(item.GetName()),
-			Created: item.GetCreatedAt(),
+			Name:        string(item.GetName()),
+			Created:     item.GetCreatedAt(),
+			Attribution: string(item.GetUserAgent()),
 		}
 	}
 	return resultBucketList, nil
@@ -366,11 +411,11 @@ type BeginObjectParams struct {
 
 func (params *BeginObjectParams) toRequest(header *pb.RequestHeader) *pb.ObjectBeginRequest {
 	return &pb.ObjectBeginRequest{
-		Header:        header,
-		Bucket:        params.Bucket,
-		EncryptedPath: params.EncryptedObjectKey,
-		Version:       params.Version,
-		ExpiresAt:     params.ExpiresAt,
+		Header:             header,
+		Bucket:             params.Bucket,
+		EncryptedObjectKey: params.EncryptedObjectKey,
+		Version:            params.Version,
+		ExpiresAt:          params.ExpiresAt,
 		RedundancyScheme: &pb.RedundancyScheme{
 			Type:             pb.RedundancyScheme_SchemeType(params.Redundancy.Algorithm),
 			ErasureShareSize: params.Redundancy.ShareSize,
@@ -426,7 +471,7 @@ func (client *Client) BeginObject(ctx context.Context, params BeginObjectParams)
 	return newBeginObjectResponse(response), nil
 }
 
-// CommitObjectParams parmaters for CommitObject method.
+// CommitObjectParams parameters for CommitObject method.
 type CommitObjectParams struct {
 	StreamID storj.StreamID
 
@@ -469,7 +514,7 @@ func (client *Client) CommitObject(ctx context.Context, params CommitObjectParam
 type GetObjectParams struct {
 	Bucket             []byte
 	EncryptedObjectKey []byte
-	Version            int32
+	Version            []byte
 
 	RedundancySchemePerSegment bool
 }
@@ -478,8 +523,8 @@ func (params *GetObjectParams) toRequest(header *pb.RequestHeader) *pb.ObjectGet
 	return &pb.ObjectGetRequest{
 		Header:                     header,
 		Bucket:                     params.Bucket,
-		EncryptedPath:              params.EncryptedObjectKey,
-		Version:                    params.Version,
+		EncryptedObjectKey:         params.EncryptedObjectKey,
+		ObjectVersion:              params.Version,
 		RedundancySchemePerSegment: params.RedundancySchemePerSegment,
 	}
 }
@@ -511,8 +556,8 @@ func newObjectInfo(object *pb.Object) RawObjectItem {
 
 	info := RawObjectItem{
 		Bucket:             string(object.Bucket),
-		EncryptedObjectKey: object.EncryptedPath,
-		Version:            uint32(object.Version),
+		EncryptedObjectKey: object.EncryptedObjectKey,
+		Version:            object.ObjectVersion,
 
 		StreamID: object.StreamId,
 
@@ -568,7 +613,6 @@ func (client *Client) GetObject(ctx context.Context, params GetObjectParams) (_ 
 type GetObjectIPsParams struct {
 	Bucket             []byte
 	EncryptedObjectKey []byte
-	Version            int32
 }
 
 // GetObjectIPsResponse is the response from GetObjectIPs.
@@ -581,10 +625,9 @@ type GetObjectIPsResponse struct {
 
 func (params *GetObjectIPsParams) toRequest(header *pb.RequestHeader) *pb.ObjectGetIPsRequest {
 	return &pb.ObjectGetIPsRequest{
-		Header:        header,
-		Bucket:        params.Bucket,
-		EncryptedPath: params.EncryptedObjectKey,
-		Version:       params.Version,
+		Header:             header,
+		Bucket:             params.Bucket,
+		EncryptedObjectKey: params.EncryptedObjectKey,
 	}
 }
 
@@ -616,7 +659,6 @@ func (client *Client) GetObjectIPs(ctx context.Context, params GetObjectIPsParam
 type UpdateObjectMetadataParams struct {
 	Bucket             []byte
 	EncryptedObjectKey []byte
-	Version            int32
 	StreamID           storj.StreamID
 
 	EncryptedMetadataNonce        storj.Nonce
@@ -629,7 +671,6 @@ func (params *UpdateObjectMetadataParams) toRequest(header *pb.RequestHeader) *p
 		Header:                        header,
 		Bucket:                        params.Bucket,
 		EncryptedObjectKey:            params.EncryptedObjectKey,
-		Version:                       params.Version,
 		StreamId:                      params.StreamID,
 		EncryptedMetadataNonce:        params.EncryptedMetadataNonce,
 		EncryptedMetadata:             params.EncryptedMetadata,
@@ -665,12 +706,12 @@ type BeginDeleteObjectParams struct {
 
 func (params *BeginDeleteObjectParams) toRequest(header *pb.RequestHeader) *pb.ObjectBeginDeleteRequest {
 	return &pb.ObjectBeginDeleteRequest{
-		Header:        header,
-		Bucket:        params.Bucket,
-		EncryptedPath: params.EncryptedObjectKey,
-		Version:       params.Version,
-		StreamId:      &params.StreamID,
-		Status:        params.Status,
+		Header:             header,
+		Bucket:             params.Bucket,
+		EncryptedObjectKey: params.EncryptedObjectKey,
+		Version:            params.Version,
+		StreamId:           &params.StreamID,
+		Status:             params.Status,
 	}
 }
 
@@ -758,15 +799,15 @@ type ListObjectsResponse struct {
 func newListObjectsResponse(response *pb.ObjectListResponse, encryptedPrefix []byte, recursive bool) ListObjectsResponse {
 	objects := make([]RawObjectListItem, len(response.Items))
 	for i, object := range response.Items {
-		encryptedObjectKey := object.EncryptedPath
+		encryptedObjectKey := object.EncryptedObjectKey
 		isPrefix := false
 		if !recursive && len(encryptedObjectKey) != 0 && encryptedObjectKey[len(encryptedObjectKey)-1] == '/' && !bytes.Equal(encryptedObjectKey, encryptedPrefix) {
 			isPrefix = true
 		}
 
 		objects[i] = RawObjectListItem{
-			EncryptedObjectKey:            object.EncryptedPath,
-			Version:                       object.Version,
+			EncryptedObjectKey:            object.EncryptedObjectKey,
+			Version:                       object.ObjectVersion,
 			Status:                        int32(object.Status),
 			StatusAt:                      object.StatusAt,
 			CreatedAt:                     object.CreatedAt,
@@ -817,11 +858,11 @@ type ListPendingObjectStreamsParams struct {
 
 func (params *ListPendingObjectStreamsParams) toRequest(header *pb.RequestHeader) *pb.ObjectListPendingStreamsRequest {
 	return &pb.ObjectListPendingStreamsRequest{
-		Header:         header,
-		Bucket:         params.Bucket,
-		EncryptedPath:  params.EncryptedObjectKey,
-		StreamIdCursor: params.EncryptedCursor,
-		Limit:          params.Limit,
+		Header:             header,
+		Bucket:             params.Bucket,
+		EncryptedObjectKey: params.EncryptedObjectKey,
+		StreamIdCursor:     params.EncryptedCursor,
+		Limit:              params.Limit,
 	}
 }
 
@@ -845,8 +886,8 @@ func newListPendingObjectStreamsResponse(response *pb.ObjectListPendingStreamsRe
 	for i, object := range response.Items {
 
 		objects[i] = RawObjectListItem{
-			EncryptedObjectKey:     object.EncryptedPath,
-			Version:                object.Version,
+			EncryptedObjectKey:     object.EncryptedObjectKey,
+			Version:                object.ObjectVersion,
 			Status:                 int32(object.Status),
 			StatusAt:               object.StatusAt,
 			CreatedAt:              object.CreatedAt,
@@ -1048,6 +1089,53 @@ func (client *Client) BeginSegment(ctx context.Context, params BeginSegmentParam
 	}
 
 	return newBeginSegmentResponse(response)
+}
+
+// RetryBeginSegmentPiecesParams parameters for RetryBeginSegmentPieces method.
+type RetryBeginSegmentPiecesParams struct {
+	SegmentID         storj.SegmentID
+	RetryPieceNumbers []int
+}
+
+func (params *RetryBeginSegmentPiecesParams) toRequest(header *pb.RequestHeader) *pb.RetryBeginSegmentPiecesRequest {
+	retryPieceNumbers := make([]int32, len(params.RetryPieceNumbers))
+	for i, pieceNumber := range params.RetryPieceNumbers {
+		retryPieceNumbers[i] = int32(pieceNumber)
+	}
+	return &pb.RetryBeginSegmentPiecesRequest{
+		Header:            header,
+		SegmentId:         params.SegmentID,
+		RetryPieceNumbers: retryPieceNumbers,
+	}
+}
+
+// RetryBeginSegmentPiecesResponse response for RetryBeginSegmentPieces request.
+type RetryBeginSegmentPiecesResponse struct {
+	SegmentID storj.SegmentID
+	Limits    []*pb.AddressedOrderLimit
+}
+
+func newRetryBeginSegmentPiecesResponse(response *pb.RetryBeginSegmentPiecesResponse) (RetryBeginSegmentPiecesResponse, error) {
+	return RetryBeginSegmentPiecesResponse{
+		SegmentID: response.SegmentId,
+		Limits:    response.AddressedLimits,
+	}, nil
+}
+
+// RetryBeginSegmentPieces exchanges piece orders.
+func (client *Client) RetryBeginSegmentPieces(ctx context.Context, params RetryBeginSegmentPiecesParams) (_ RetryBeginSegmentPiecesResponse, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	var response *pb.RetryBeginSegmentPiecesResponse
+	err = WithRetry(ctx, func(ctx context.Context) error {
+		response, err = client.client.RetryBeginSegmentPieces(ctx, params.toRequest(client.header()))
+		return err
+	})
+	if err != nil {
+		return RetryBeginSegmentPiecesResponse{}, Error.Wrap(err)
+	}
+
+	return newRetryBeginSegmentPiecesResponse(response)
 }
 
 // CommitSegmentParams parameters for CommitSegment method.
@@ -1280,7 +1368,7 @@ func (client *Client) DownloadObject(ctx context.Context, params DownloadObjectP
 	})
 	if err != nil {
 		if errs2.IsRPC(err, rpcstatus.NotFound) {
-			return DownloadObjectResponse{}, storj.ErrObjectNotFound.Wrap(err)
+			return DownloadObjectResponse{}, ErrObjectNotFound.Wrap(err)
 		}
 		return DownloadObjectResponse{}, Error.Wrap(err)
 	}
@@ -1473,10 +1561,7 @@ func (client *Client) Batch(ctx context.Context, requests ...BatchItem) (resp []
 
 	resp = make([]BatchResponse, len(response.Responses))
 	for i, response := range response.Responses {
-		resp[i] = BatchResponse{
-			pbRequest:  batchItems[i].Request,
-			pbResponse: response.Response,
-		}
+		resp[i] = MakeBatchResponse(batchItems[i], response)
 	}
 
 	return resp, nil

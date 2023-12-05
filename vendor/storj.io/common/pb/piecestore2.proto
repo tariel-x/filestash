@@ -20,9 +20,13 @@ service Piecestore {
     rpc DeletePieces(DeletePiecesRequest) returns (DeletePiecesResponse);
     rpc Retain(RetainRequest) returns (RetainResponse);
     rpc RestoreTrash(RestoreTrashRequest) returns (RestoreTrashResponse) {}
+    // Exists checks if requested pieces exists on storage node. Will check only
+    // pieces which belongs to the satellite that call this method.
+    rpc Exists(ExistsRequest) returns (ExistsResponse);
 }
 
 // Expected order of messages from uplink:
+//
 //   OrderLimit ->
 //   repeated
 //      Order ->
@@ -32,6 +36,12 @@ service Piecestore {
 message PieceUploadRequest {
     // first message to show that we are allowed to upload
     orders.OrderLimit limit = 1;
+
+    // first message must have it if (!) not the default sha256 is used, as it
+    // should be initialized by the storagenode before upload.
+    // should match with the algorithm in the done field of the last message
+    orders.PieceHashAlgorithm hash_algorithm = 5;
+
     // order for uploading
     orders.Order      order = 2;
 
@@ -47,9 +57,13 @@ message PieceUploadRequest {
 
 message PieceUploadResponse {
     orders.PieceHash done = 1;
+    // this is for validating the PieceHash signature if the cert chain is
+    // unable to be pulled off the connection (Noise instead of TLS).
+    bytes node_certchain = 2;
 }
 
 // Expected order of messages from uplink:
+//
 //   {OrderLimit, Chunk} ->
 //   go repeated
 //      Order -> (async)
@@ -69,6 +83,11 @@ message PieceDownloadRequest {
 
     // request for the chunk
     Chunk chunk = 3;
+
+    // maximum_chunk_size is an advisory request from the uplink to
+    // the storage node on how big the chunks should be. smaller
+    // maximum sizes may reduce time to first byte and peak memory usage.
+    int32 maximum_chunk_size = 4;
 }
 
 message PieceDownloadResponse {
@@ -80,6 +99,7 @@ message PieceDownloadResponse {
     Chunk chunk = 1;
     orders.PieceHash hash = 2;
     orders.OrderLimit limit = 3;
+    bool restored_from_trash = 4;
 }
 
 message PieceDeleteRequest {
@@ -119,6 +139,9 @@ message PieceHeader {
     FormatVersion format_version = 1;
     // content hash of the piece
     bytes hash = 2;
+    // the algorithm of the hash
+    orders.PieceHashAlgorithm hash_algorithm = 6;
+
     // timestamp when upload occurred, as given by the "timestamp" field in the original orders.PieceHash
     google.protobuf.Timestamp creation_time = 3 [(gogoproto.stdtime) = true, (gogoproto.nullable) = false];
     // signature from uplink over the original orders.PieceHash (the corresponding PieceHashSigning
@@ -128,4 +151,13 @@ message PieceHeader {
     // the OrderLimit authorizing storage of this piece, as signed by the satellite and sent by
     // the uplink
     orders.OrderLimit order_limit = 5 [(gogoproto.nullable) = false];
+}
+
+message ExistsRequest {
+    repeated bytes piece_ids = 1 [(gogoproto.customtype) = "PieceID", (gogoproto.nullable) = false];
+}
+
+message ExistsResponse {
+    // input piece ids indices of the missing pieces
+    repeated uint32 missing = 1;
 }

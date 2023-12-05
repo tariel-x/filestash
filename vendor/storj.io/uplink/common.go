@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	_ "unsafe" // for go:linkname
 
+	"github.com/jtolio/eventkit"
 	"github.com/spacemonkeygo/monkit/v3"
 	"github.com/zeebo/errs"
 
@@ -16,9 +18,11 @@ import (
 	"storj.io/common/errs2"
 	"storj.io/common/rpc/rpcstatus"
 	"storj.io/uplink/private/metaclient"
+	"storj.io/uplink/private/piecestore"
 )
 
 var mon = monkit.Package()
+var evs = eventkit.Package()
 
 // We use packageError.Wrap/New instead of plain errs.Wrap/New to add a prefix "uplink" to every error
 // message emitted by the Uplink library.
@@ -40,6 +44,7 @@ var ErrSegmentsLimitExceeded = errors.New("segments limit exceeded")
 // ErrPermissionDenied is returned when the request is denied due to invalid permissions.
 var ErrPermissionDenied = errors.New("permission denied")
 
+//go:linkname convertKnownErrors
 func convertKnownErrors(err error, bucket, key string) error {
 	switch {
 	case errors.Is(err, io.EOF):
@@ -71,13 +76,17 @@ func convertKnownErrors(err error, bucket, key string) error {
 			return packageError.Wrap(rpcstatus.Wrap(rpcstatus.ResourceExhausted, ErrSegmentsLimitExceeded))
 		}
 	case errs2.IsRPC(err, rpcstatus.NotFound):
+		const (
+			bucketNotFoundPrefix = "bucket not found"
+			objectNotFoundPrefix = "object not found"
+		)
+
 		message := errs.Unwrap(err).Error()
-		if strings.HasPrefix(message, metaclient.ErrBucketNotFound.New("").Error()) {
-			prefixLength := len(metaclient.ErrBucketNotFound.New("").Error())
+		if strings.HasPrefix(message, bucketNotFoundPrefix) {
 			// remove error prefix + ": " from message
-			bucket := message[prefixLength+2:]
+			bucket := strings.TrimPrefix(message[len(bucketNotFoundPrefix):], ": ")
 			return errwrapf("%w (%q)", ErrBucketNotFound, bucket)
-		} else if strings.HasPrefix(message, metaclient.ErrObjectNotFound.New("").Error()) {
+		} else if strings.HasPrefix(message, objectNotFoundPrefix) {
 			return errwrapf("%w (%q)", ErrObjectNotFound, key)
 		}
 	case errs2.IsRPC(err, rpcstatus.PermissionDenied):
@@ -135,3 +144,18 @@ func (err *joinedErr) Error() string {
 func (err *joinedErr) Ungroup() []error {
 	return []error{err.main, err.alt}
 }
+
+var noiseVersion = func() int64 {
+	if piecestore.NoiseEnabled {
+		// this is a number that indicates what noise support exists so far.
+		// 1 was our first implementation, but crucially had an errant round
+		// trip on uploads and downloads. 2 has the round trip fixed for
+		// downloads but not uploads. 3 has long tail cancelation for
+		// downloads fixed. 4 has round trips reduced for small uploads.
+		// we'll probably have future values here.
+		// we'll want to compare the performance of these different cases.
+		return 4
+	}
+	// 0 means no noise
+	return 0
+}()

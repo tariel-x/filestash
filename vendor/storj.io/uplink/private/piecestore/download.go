@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jtolio/eventkit"
 	"github.com/zeebo/errs"
 
 	"storj.io/common/context2"
@@ -21,29 +22,36 @@ import (
 	"storj.io/common/sync2"
 )
 
+var evs = eventkit.Package()
+
 // Download implements downloading from a piecestore.
 type Download struct {
 	client     *Client
 	limit      *pb.OrderLimit
 	privateKey storj.PiecePrivateKey
-	nodeID     storj.NodeID
 	stream     downloadStream
 	ctx        context.Context
 	cancelCtx  func(error)
 
+	offset       int64 // the offset into the piece
 	read         int64 // how much data we have read so far
 	allocated    int64 // how far have we sent orders
 	downloaded   int64 // how much data have we downloaded
 	downloadSize int64 // how much do we want to download
 
+	downloadRequestSent bool
+
 	// what is the step we consider to upload
-	allocationStep int64
+	orderStep int64
 
 	unread ReadBuffer
 
 	// hash and originLimit are received in the event of a GET_REPAIR
 	hash        *pb.PieceHash
 	originLimit *pb.OrderLimit
+
+	// did the storagenode restore the piece from trash to serve the download request
+	restoredFromTrashSent bool
 
 	close        sync.Once
 	closingError syncError
@@ -55,15 +63,21 @@ type downloadStream interface {
 	Recv() (*pb.PieceDownloadResponse, error)
 }
 
+var monClientDownloadTask = mon.Task()
+
 // Download starts a new download using the specified order limit at the specified offset and size.
 func (client *Client) Download(ctx context.Context, limit *pb.OrderLimit, piecePrivateKey storj.PiecePrivateKey, offset, size int64) (_ *Download, err error) {
-	defer mon.Task()(&ctx)(&err)
+	defer monClientDownloadTask(&ctx)(&err)
 
 	ctx, cancel := context2.WithCustomCancel(ctx)
 
 	var underlyingStream downloadStream
 	sync2.WithTimeout(client.config.MessageTimeout, func() {
-		underlyingStream, err = client.client.Download(ctx)
+		if client.replaySafe != nil {
+			underlyingStream, err = client.replaySafe.Download(ctx)
+		} else {
+			underlyingStream, err = client.client.Download(ctx)
+		}
 	}, func() {
 		cancel(errMessageTimeout)
 	})
@@ -77,43 +91,29 @@ func (client *Client) Download(ctx context.Context, limit *pb.OrderLimit, pieceP
 		cancel:  cancel,
 	}
 
-	err = stream.Send(&pb.PieceDownloadRequest{
-		Limit: limit,
-		Chunk: &pb.PieceDownloadRequest_Chunk{
-			Offset:    offset,
-			ChunkSize: size,
-		},
-	})
-	if err != nil {
-		_, recvErr := stream.Recv()
-		_ = stream.Close()
-		cancel(context.Canceled)
-		return nil, ErrProtocol.Wrap(errs.Combine(err, recvErr))
-	}
-
 	return &Download{
 		client:     client,
 		limit:      limit,
 		privateKey: piecePrivateKey,
-		nodeID:     limit.StorageNodeId,
 		stream:     stream,
 		ctx:        ctx,
 		cancelCtx:  cancel,
 
-		read: 0,
+		offset: offset,
+		read:   0,
 
 		allocated:    0,
 		downloaded:   0,
 		downloadSize: size,
 
-		allocationStep: client.config.InitialStep,
+		orderStep: client.config.InitialStep,
 	}, nil
 }
 
 // Read downloads data from the storage node allocating as necessary.
 func (client *Download) Read(data []byte) (read int, err error) {
 	ctx := client.ctx
-	defer mon.Task()(&ctx, "node: "+client.nodeID.String()[0:8])(&err)
+	defer mon.Task()(&ctx, "node: "+client.limit.StorageNodeId.String()[0:8])(&err)
 
 	if client.closingError.IsSet() {
 		return 0, io.ErrClosedPipe
@@ -136,8 +136,8 @@ func (client *Download) Read(data []byte) (read int, err error) {
 
 		// do we need to send a new order to storagenode
 		notYetReceived := client.allocated - client.downloaded
-		if notYetReceived < client.allocationStep {
-			newAllocation := client.allocationStep
+		if notYetReceived < client.orderStep {
+			newAllocation := client.orderStep
 
 			// If we have downloaded more than we have allocated
 			// due to a generous storagenode include this in the next allocation.
@@ -164,9 +164,47 @@ func (client *Download) Read(data []byte) (read int, err error) {
 					return read, nil
 				}
 
-				err = client.stream.Send(&pb.PieceDownloadRequest{
-					Order: order,
-				})
+				err = func() error {
+					if client.downloadRequestSent {
+						return client.stream.Send(&pb.PieceDownloadRequest{
+							Order: order,
+						})
+					}
+					client.downloadRequestSent = true
+
+					if client.client.NodeURL().NoiseInfo.Proto != storj.NoiseProto_Unset {
+						// all nodes that have noise support also support
+						// combining the order and the piece download request
+						// into one protobuf.
+						return client.stream.Send(&pb.PieceDownloadRequest{
+							Limit: client.limit,
+							Chunk: &pb.PieceDownloadRequest_Chunk{
+								Offset:    client.offset,
+								ChunkSize: client.downloadSize,
+							},
+							Order:            order,
+							MaximumChunkSize: client.client.config.MaximumChunkSize,
+						})
+					}
+
+					// nodes that don't support noise don't necessarily
+					// support these combined messages, but also don't
+					// benefit much from them being combined.
+					err := client.stream.Send(&pb.PieceDownloadRequest{
+						Limit: client.limit,
+						Chunk: &pb.PieceDownloadRequest_Chunk{
+							Offset:    client.offset,
+							ChunkSize: client.downloadSize,
+						},
+						MaximumChunkSize: client.client.config.MaximumChunkSize,
+					})
+					if err != nil {
+						return err
+					}
+					return client.stream.Send(&pb.PieceDownloadRequest{
+						Order: order,
+					})
+				}()
 				if err != nil {
 					// other side doesn't want to talk to us anymore or network went down
 					client.unread.IncludeError(err)
@@ -182,7 +220,7 @@ func (client *Download) Read(data []byte) (read int, err error) {
 
 				// update our allocation step
 				client.allocated += newAllocation
-				client.allocationStep = client.client.nextAllocationStep(client.allocationStep)
+				client.orderStep = client.client.nextOrderStep(client.orderStep)
 			}
 		}
 
@@ -201,6 +239,15 @@ func (client *Download) Read(data []byte) (read int, err error) {
 		if response != nil && response.Hash != nil && response.Limit != nil {
 			client.hash = response.Hash
 			client.originLimit = response.Limit
+		}
+
+		if !client.restoredFromTrashSent && response != nil && response.RestoredFromTrash {
+			client.restoredFromTrashSent = true
+			evs.Event("piece-download",
+				eventkit.String("node_id", client.limit.StorageNodeId.String()),
+				eventkit.String("piece_id", client.limit.PieceId.String()),
+				eventkit.Bool("restored_from_trash", true),
+			)
 		}
 
 		// we may have some data buffered, so we cannot immediately return the error
@@ -255,7 +302,7 @@ func (client *Download) Close() error {
 
 	err := client.closingError.Get()
 	if err != nil {
-		details := errs.Class(fmt.Sprintf("(Node ID: %s, Piece ID: %s)", client.nodeID.String(), client.limit.PieceId.String()))
+		details := errs.Class(fmt.Sprintf("(Node ID: %s, Piece ID: %s)", client.limit.StorageNodeId.String(), client.limit.PieceId.String()))
 		err = details.Wrap(Error.Wrap(err))
 	}
 

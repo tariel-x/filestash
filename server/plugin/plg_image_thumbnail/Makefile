@@ -1,4 +1,4 @@
-PLATFORM=linux
+wPLATFORM=linux
 ARCH=amd64
 
 all:

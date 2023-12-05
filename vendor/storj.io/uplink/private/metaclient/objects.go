@@ -185,7 +185,6 @@ func (db *DB) UpdateObjectMetadata(ctx context.Context, bucket, key string, newM
 	return db.metainfo.UpdateObjectMetadata(ctx, UpdateObjectMetadataParams{
 		Bucket:                        []byte(bucket),
 		EncryptedObjectKey:            []byte(encPath.Raw()),
-		Version:                       int32(object.Version),
 		StreamID:                      object.Stream.ID,
 		EncryptedMetadata:             streamMetaBytes,
 		EncryptedMetadataEncryptedKey: encryptedKey,
@@ -358,34 +357,54 @@ func (db *DB) ListObjects(ctx context.Context, bucket string, options ListOption
 		return ObjectList{}, errClass.Wrap(err)
 	}
 
-	items, more, err := db.metainfo.ListObjects(ctx, ListObjectsParams{
-		Bucket:                []byte(bucket),
-		EncryptedPrefix:       []byte(pi.ParentEnc.Raw()),
-		EncryptedCursor:       []byte(startAfter),
-		Limit:                 int32(options.Limit),
-		IncludeCustomMetadata: options.IncludeCustomMetadata,
-		IncludeSystemMetadata: options.IncludeSystemMetadata,
-		Recursive:             options.Recursive,
-		Status:                options.Status,
-	})
-	if err != nil {
-		return ObjectList{}, errClass.Wrap(err)
+	startAfterEnc := []byte(startAfter)
+	if len(options.CursorEnc) > 0 {
+		startAfterEnc = options.CursorEnc
 	}
 
-	objectsList, err := db.objectsFromRawObjectList(ctx, items, pi, startAfter)
-	if err != nil {
-		return ObjectList{}, errClass.Wrap(err)
+	var m bool
+	var objectsList []Object
+	// Keep looking until we find an object we can decrypt or we run out of objects
+	for {
+		items, more, err := db.metainfo.ListObjects(ctx, ListObjectsParams{
+			Bucket:                []byte(bucket),
+			EncryptedPrefix:       []byte(pi.ParentEnc.Raw()),
+			EncryptedCursor:       startAfterEnc,
+			Limit:                 int32(options.Limit),
+			IncludeCustomMetadata: options.IncludeCustomMetadata,
+			IncludeSystemMetadata: options.IncludeSystemMetadata,
+			Recursive:             options.Recursive,
+			Status:                options.Status,
+		})
+		if err != nil {
+			return ObjectList{}, errClass.Wrap(err)
+		}
+		m = more
+
+		objectsList, err = db.objectsFromRawObjectList(ctx, items, pi)
+		if err != nil {
+			return ObjectList{}, errClass.Wrap(err)
+		}
+
+		if len(items) > 0 {
+			startAfterEnc = items[len(items)-1].EncryptedObjectKey
+		}
+
+		if len(objectsList) != 0 || !more {
+			break
+		}
 	}
 
 	return ObjectList{
 		Bucket: bucket,
 		Prefix: options.Prefix,
-		More:   more,
+		More:   m,
 		Items:  objectsList,
+		Cursor: startAfterEnc,
 	}, nil
 }
 
-func (db *DB) objectsFromRawObjectList(ctx context.Context, items []RawObjectListItem, pi *encryption.PrefixInfo, startAfter string) (objectList []Object, err error) {
+func (db *DB) objectsFromRawObjectList(ctx context.Context, items []RawObjectListItem, pi *encryption.PrefixInfo) (objectList []Object, err error) {
 	objectList = make([]Object, 0, len(items))
 
 	for _, item := range items {
@@ -437,6 +456,7 @@ type DownloadOptions struct {
 // DownloadInfo contains response for DownloadObject.
 type DownloadInfo struct {
 	Object             Object
+	EncPath            paths.Encrypted
 	DownloadedSegments []DownloadSegmentWithRSResponse
 	ListSegments       ListSegmentsResponse
 	Range              StreamRange
@@ -447,10 +467,10 @@ func (db *DB) DownloadObject(ctx context.Context, bucket, key string, options Do
 	defer mon.Task()(&ctx)(&err)
 
 	if bucket == "" {
-		return DownloadInfo{}, storj.ErrNoBucket.New("")
+		return DownloadInfo{}, ErrNoBucket.New("")
 	}
 	if key == "" {
-		return DownloadInfo{}, storj.ErrNoPath.New("")
+		return DownloadInfo{}, ErrNoPath.New("")
 	}
 
 	encPath, err := encryption.EncryptPathWithStoreCipher(bucket, paths.NewUnencrypted(key), db.encStore)
@@ -467,10 +487,10 @@ func (db *DB) DownloadObject(ctx context.Context, bucket, key string, options Do
 		return DownloadInfo{}, err
 	}
 
-	return db.newDownloadInfo(ctx, bucket, key, resp, options.Range)
+	return db.newDownloadInfo(ctx, bucket, key, encPath, resp, options.Range)
 }
 
-func (db *DB) newDownloadInfo(ctx context.Context, bucket, key string, response DownloadObjectResponse, streamRange StreamRange) (DownloadInfo, error) {
+func (db *DB) newDownloadInfo(ctx context.Context, bucket, key string, encPath paths.Encrypted, response DownloadObjectResponse, streamRange StreamRange) (DownloadInfo, error) {
 	object, err := db.ObjectFromRawObjectItem(ctx, bucket, key, response.Object)
 	if err != nil {
 		return DownloadInfo{}, err
@@ -478,6 +498,7 @@ func (db *DB) newDownloadInfo(ctx context.Context, bucket, key string, response 
 
 	return DownloadInfo{
 		Object:             object,
+		EncPath:            encPath,
 		DownloadedSegments: response.DownloadedSegments,
 		ListSegments:       response.ListSegments,
 		Range:              streamRange.Normalize(object.Size),
@@ -494,7 +515,7 @@ func (db *DB) ListSegments(ctx context.Context, params ListSegmentsParams) (resp
 }
 
 // GetObject returns information about an object.
-func (db *DB) GetObject(ctx context.Context, bucket, key string) (info Object, err error) {
+func (db *DB) GetObject(ctx context.Context, bucket, key string, version []byte) (info Object, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	if bucket == "" {
@@ -513,6 +534,7 @@ func (db *DB) GetObject(ctx context.Context, bucket, key string) (info Object, e
 	objectInfo, err := db.metainfo.GetObject(ctx, GetObjectParams{
 		Bucket:                     []byte(bucket),
 		EncryptedObjectKey:         []byte(encPath.Raw()),
+		Version:                    version,
 		RedundancySchemePerSegment: true,
 	})
 	if err != nil {
@@ -583,7 +605,7 @@ func (db *DB) ObjectFromRawObjectItem(ctx context.Context, bucket, key string, o
 
 func (db *DB) objectFromRawObjectListItem(bucket string, path storj.Path, listItem RawObjectListItem, stream *pb.StreamInfo, streamMeta pb.StreamMeta) (Object, error) {
 	object := Object{
-		Version:  uint32(listItem.Version),
+		Version:  listItem.Version,
 		Bucket:   Bucket{Name: bucket},
 		Path:     path,
 		IsPrefix: listItem.IsPrefix,

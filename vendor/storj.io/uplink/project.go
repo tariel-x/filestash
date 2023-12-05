@@ -7,12 +7,11 @@ import (
 	"context"
 
 	"github.com/zeebo/errs"
-	"golang.org/x/sync/errgroup"
 
+	"storj.io/common/leak"
 	"storj.io/common/memory"
 	"storj.io/common/rpc"
 	"storj.io/common/storj"
-	"storj.io/uplink/internal/telemetryclient"
 	"storj.io/uplink/private/ecclient"
 	"storj.io/uplink/private/metaclient"
 	"storj.io/uplink/private/storage/streams"
@@ -29,16 +28,16 @@ var maxSegmentSize string
 
 // Project provides access to managing buckets and objects.
 type Project struct {
-	config               Config
-	access               *Access
-	dialer               rpc.Dialer
-	ec                   ecclient.Client
-	segmentSize          int64
-	encryptionParameters storj.EncryptionParameters
+	config                        Config
+	access                        *Access
+	satelliteDialer               rpc.Dialer
+	storagenodeDialer             rpc.Dialer
+	ec                            ecclient.Client
+	segmentSize                   int64
+	encryptionParameters          storj.EncryptionParameters
+	concurrentSegmentUploadConfig *testuplink.ConcurrentSegmentUploadsConfig
 
-	eg              *errgroup.Group
-	telemetry       telemetryclient.Client
-	telemetryCancel func()
+	tracker leak.Ref
 }
 
 // OpenProject opens a project with the specific access grant.
@@ -70,26 +69,13 @@ func (config Config) OpenProject(ctx context.Context, access *Access) (project *
 		return nil, packageError.Wrap(err)
 	}
 
-	var telemetry telemetryclient.Client
-	if ctor, ok := telemetryclient.ConstructorFrom(ctx); ok {
-		telemetry, err = ctor(access.satelliteURL.String())
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	dialer, err := config.getDialer(ctx)
+	storagenodeDialer, err := config.getDialerForPool(ctx, config.pool)
 	if err != nil {
 		return nil, packageError.Wrap(err)
 	}
-
-	telemetryCtx, telemetryCancel := context.WithCancel(ctx)
-	var eg errgroup.Group
-	if telemetry != nil {
-		eg.Go(func() error {
-			telemetry.Run(telemetryCtx)
-			return nil
-		})
+	satelliteDialer, err := config.getDialerForPool(ctx, config.satellitePool)
+	if err != nil {
+		return nil, packageError.Wrap(err)
 	}
 
 	// TODO: This should come from the EncryptionAccess. For now it's hardcoded to twice the
@@ -97,7 +83,9 @@ func (config Config) OpenProject(ctx context.Context, access *Access) (project *
 	encBlockSize := 29 * 256 * memory.B.Int32()
 
 	encryptionParameters := storj.EncryptionParameters{
-		// TODO: the cipher should be provided by the Access, but we don't store it there yet.
+		// N.B.: This is the ciphersuite we use for encrypting content keys,
+		// which should absolutely be encrypted, even if the access grant
+		// says EncNull.
 		CipherSuite: storj.EncAESGCM,
 		BlockSize:   encBlockSize,
 	}
@@ -112,7 +100,6 @@ func (config Config) OpenProject(ctx context.Context, access *Access) (project *
 	if maxSegmentSize != "" {
 		segmentsSize, err = memory.ParseString(maxSegmentSize)
 		if err != nil {
-			telemetryCancel()
 			return nil, packageError.Wrap(err)
 		}
 	} else {
@@ -122,38 +109,40 @@ func (config Config) OpenProject(ctx context.Context, access *Access) (project *
 		}
 	}
 
-	ec := ecclient.New(dialer, 0)
+	ec := ecclient.New(storagenodeDialer, 0)
+
+	tracker := leak.FromContext(ctx)
+	if tracker == (leak.Ref{}) { // TODO: handle this check better
+		tracker = leak.Root(1)
+	}
 
 	return &Project{
-		config:               config,
-		access:               access,
-		dialer:               dialer,
-		ec:                   ec,
-		segmentSize:          segmentsSize,
-		encryptionParameters: encryptionParameters,
+		config:                        config,
+		access:                        access,
+		satelliteDialer:               satelliteDialer,
+		storagenodeDialer:             storagenodeDialer,
+		ec:                            ec,
+		segmentSize:                   segmentsSize,
+		encryptionParameters:          encryptionParameters,
+		concurrentSegmentUploadConfig: testuplink.GetConcurrentSegmentUploadsConfig(ctx),
 
-		eg:              &eg,
-		telemetry:       telemetry,
-		telemetryCancel: telemetryCancel,
+		tracker: tracker,
 	}, nil
 }
 
 // Close closes the project and all associated resources.
 func (project *Project) Close() (err error) {
-	if project.telemetry != nil {
-		project.telemetryCancel()
-		err = errs.Combine(
-			project.eg.Wait(),
-			project.telemetry.Report(context.Background()),
-		)
-	}
-
-	// only close the connection pool if it's created through OpenProject
+	// only close the connection pools if it's created through OpenProject / getDialer()
 	if project.config.pool == nil {
-		err = errs.Combine(err, project.dialer.Pool.Close())
+		err = errs.Combine(err, project.storagenodeDialer.Pool.Close())
+
+		if project.config.satellitePool == nil {
+			// if config.satellitePool is nil, but config.pool is not, it might be a second Close, but it's safe.
+			err = errs.Combine(err, project.satelliteDialer.Pool.Close())
+		}
 	}
 
-	return packageError.Wrap(err)
+	return packageError.Wrap(errs.Combine(err, project.tracker.Close()))
 }
 
 func (project *Project) getStreamsStore(ctx context.Context) (_ *streams.Store, err error) {
@@ -169,13 +158,19 @@ func (project *Project) getStreamsStore(ctx context.Context) (_ *streams.Store, 
 		}
 	}()
 
+	var longTailMargin int
+	if project.concurrentSegmentUploadConfig != nil {
+		longTailMargin = project.concurrentSegmentUploadConfig.LongTailMargin
+	}
+
 	streamStore, err := streams.NewStreamStore(
 		metainfoClient,
 		project.ec,
 		project.segmentSize,
 		project.access.encAccess.Store,
 		project.encryptionParameters,
-		maxInlineSize)
+		maxInlineSize,
+		longTailMargin)
 	if err != nil {
 		return nil, packageError.Wrap(err)
 	}
@@ -198,7 +193,7 @@ func (project *Project) dialMetainfoClient(ctx context.Context) (_ *metaclient.C
 	defer mon.Task()(&ctx)(&err)
 
 	metainfoClient, err := metaclient.DialNodeURL(ctx,
-		project.dialer,
+		project.satelliteDialer,
 		project.access.satelliteURL.String(),
 		project.access.apiKey,
 		project.config.UserAgent)

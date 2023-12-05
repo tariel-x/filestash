@@ -64,11 +64,12 @@ used to control details of how the Stream operates.
 #### func (*Stream) Cancel
 
 ```go
-func (s *Stream) Cancel(err error)
+func (s *Stream) Cancel(err error) bool
 ```
 Cancel transitions the stream into a state where all writes to the transport
 will return the provided error, and terminates the stream. It is a no-op if the
-stream is already terminated.
+stream is already finished, and returns a boolean indicating if that was the
+case.
 
 #### func (*Stream) Close
 
@@ -169,6 +170,16 @@ func (s *Stream) RawWrite(kind drpcwire.Kind, data []byte) (err error)
 ```
 RawWrite sends the data bytes with the given kind.
 
+#### func (*Stream) SendCancel
+
+```go
+func (s *Stream) SendCancel(err error) (bool, error)
+```
+SendCancel transitions the stream into the canceled state with context.Canceled
+and sends a cancel error to the remote side for a soft cancel. It is a no-op if
+the stream is already terminated. It returns true for busy if writes are already
+blocked and a hard cancel is required.
+
 #### func (*Stream) SendError
 
 ```go
@@ -176,6 +187,34 @@ func (s *Stream) SendError(serr error) (err error)
 ```
 SendError terminates the stream and sends the error to the remote. It is a no-op
 if the stream is already terminated.
+
+#### func (*Stream) SetManualFlush
+
+```go
+func (s *Stream) SetManualFlush(mf bool)
+```
+SetManualFlush sets the ManualFlush option. It cannot be called concurrently
+with any sends or receives on the stream. Example use case:
+
+    flusher := stream.(interface{
+        GetStream() drpc.Stream
+    }).GetStream().(interface{
+        SetManualFlush(bool)
+    })
+
+    flusher.SetManualFlush(true)
+    err = stream.Send(&pb.Message{Request: "hello, "})
+    flusher.SetManualFlush(false)
+    if err != nil {
+        return err
+    }
+
+    // the next send will send both messages in the same write
+    // to the underlying connection.
+    err = stream.Send(&pb.Message{Request: "world!"})
+    if err != nil {
+        return err
+    }
 
 #### func (*Stream) String
 

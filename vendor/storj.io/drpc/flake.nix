@@ -21,7 +21,7 @@
             ]));
           };
           subPackages = [ "cmd/protoc-gen-go-drpc" ];
-          vendorSha256 = "sha256-3kIFjZDi2qnEDXDY0ozvylxJlBePkK7IPFOVipsfLBU=";
+          vendorSha256 = "sha256-NMa9c+QIq9VEUQZqZ5X9fNbZDJT99q8XNCH2rRKyMzQ=";
         };
 
         devShell =
@@ -31,12 +31,12 @@
               src = fetchFromGitHub {
                 owner = "dominikh";
                 repo = "go-tools";
-                rev = "v0.2.0";
-                sha256 = "sha256-QhTjzrERhbhCSkPzyLQwFyxrktNoGL9ris+XfE7n5nQ=";
+                rev = "2023.1.2";
+                sha256 = "sha256-Xnylkv0n3FExQ4e4pmD6DAUqGtud80wHHoVY56UXfOU";
               };
               doCheck = false;
               subPackages = [ "cmd/staticcheck" ];
-              vendorSha256 = "sha256-EjCOMdeJ0whp2pHZvm4VV2K78UNKzl98Z/cQvGhWSyY=";
+              vendorSha256 = "sha256-o9UtS6AMgRYuAkOWdktG2Kr3QDBDQTOGSlya69K2br8";
             };
 
             ci = buildGoModule {
@@ -44,11 +44,11 @@
               src = fetchFromGitHub {
                 owner = "storj";
                 repo = "ci";
-                rev = "63f7574acdb97dd567c64537228d8582980ec301";
-                sha256 = "sha256-AkrUZbS88BLc3dtWxYkecUNa29slwQ7/feT9+lPWO9g=";
+                rev = "37130d944fc8b60928fd460fe53ebaa7204c8102";
+                sha256 = "sha256-NcsLA5d5sF1qSPSu/Pw/Md+0nr+inXAsPx9bKWh3I7Y=";
               };
               doCheck = false;
-              vendorSha256 = "sha256-6D452YbnkunAfD/M69VmwGDxENmVS72NKj92FTemJR0=";
+              vendorSha256 = "sha256-G5cAb9zFqjdCLIodGcPv9u4ABZZKEGTx0CvB4i7JdRg=";
               allowGoReference = true; # until check-imports stops needing this
               subPackages = [
                 "check-copyright"
@@ -81,8 +81,21 @@
                 sha256 = "sha256-wkUvMsoJP38KMD5b3Fz65R1cnpeTtDcVqgE7tNlZXys=";
               };
               doCheck = false;
-              vendorSha256 = "sha256-pQpattmS9VmO3ZIQUFn66az8GSmB4IvYhTTCFn6SUmo=";
+              vendorSha256 = null;
               modRoot = "./cmd/protoc-gen-go";
+            };
+
+            protoc-gen-gogo = buildGoPackage {
+              name = "protoc-gen-gogo";
+              src = fetchFromGitHub {
+                owner = "gogo";
+                repo = "protobuf";
+                rev = "v1.3.2";
+                sha256 = "sha256-CoUqgLFnLNCS9OxKFS7XwjE17SlH6iL1Kgv+0uEK2zU=";
+              };
+              doCheck = false;
+              goPackagePath = "github.com/gogo/protobuf";
+              subPackages = [ "./protoc-gen-gogo" ];
             };
 
             protoc-gen-twirp = buildGoPackage {
@@ -90,8 +103,8 @@
               src = fetchFromGitHub {
                 owner = "twitchtv";
                 repo = "twirp";
-                rev = "v8.1.0";
-                sha256 = "sha256-ezSNrDfOE1nj4FlX7E7Z7/eGfQw1B7NP34aj8ml5pDk=";
+                rev = "v8.1.3";
+                sha256 = "sha256-p3gHVHGBHakOOQnJAuMK7vZumNXN15mOABuEHUG0wNs=";
               };
               doCheck = false;
               goPackagePath = "github.com/twitchtv/twirp";
@@ -103,11 +116,11 @@
               src = fetchFromGitHub {
                 owner = "golang";
                 repo = "tools";
-                rev = "v0.1.4";
-                sha256 = "sha256-7iQZvA6uUjZLP3/dxaM9y9jomSwEoaUgGclnciF8rh4=";
+                rev = "v0.3.0";
+                sha256 = "sha256-UMEhFxODGQ20vkZPtscBpHhUDa6/+hnD85Z1yx0pQfQ=";
               };
               doCheck = false;
-              vendorSha256 = "sha256-PRC59obp0ptooFuWhg2ruihEfJ0wKeMyT9xcLjoZyCo=";
+              vendorSha256 = "sha256-EQHYf4Q+XNjwG/KDoTA4m0mlBGxPkJSLUcO0VHFSpeA=";
               subPackages = [ "cmd/stringer" ];
             };
 
@@ -128,7 +141,7 @@
             buildInputs = [
               defaultPackage
 
-              go_1_17
+              go_1_19
               golangci-lint
               protobuf
               graphviz
@@ -137,6 +150,7 @@
 
               devtools.protoc-gen-go-grpc
               devtools.protoc-gen-go
+              devtools.protoc-gen-gogo
               devtools.protoc-gen-twirp
               devtools.staticcheck
               devtools.ci

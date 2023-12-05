@@ -6,10 +6,7 @@ package eestream
 import (
 	"context"
 	"io"
-	"io/ioutil"
 	"os"
-
-	"github.com/vivint/infectious"
 
 	"storj.io/common/encryption"
 	"storj.io/common/fpath"
@@ -19,36 +16,12 @@ import (
 	"storj.io/common/readcloser"
 	"storj.io/common/storj"
 	"storj.io/common/sync2"
+	"storj.io/infectious"
+	"storj.io/uplink/private/eestream/improved"
 )
 
-// ErasureScheme represents the general format of any erasure scheme algorithm.
-// If this interface can be implemented, the rest of this library will work
-// with it.
-type ErasureScheme interface {
-	// Encode will take 'in' and call 'out' with erasure coded pieces.
-	Encode(in []byte, out func(num int, data []byte)) error
-
-	// EncodeSingle will take 'in' with the stripe and fill 'out' with the erasure share for piece 'num'.
-	EncodeSingle(in, out []byte, num int) error
-
-	// Decode will take a mapping of available erasure coded piece num -> data,
-	// 'in', and append the combined data to 'out', returning it.
-	Decode(out []byte, in map[int][]byte) ([]byte, error)
-
-	// ErasureShareSize is the size of the erasure shares that come from Encode
-	// and are passed to Decode.
-	ErasureShareSize() int
-
-	// StripeSize is the size the stripes that are passed to Encode and come
-	// from Decode.
-	StripeSize() int
-
-	// Encode will generate this many erasure shares and therefore this many pieces.
-	TotalCount() int
-
-	// Decode requires at least this many pieces.
-	RequiredCount() int
-}
+// ErasureScheme is an interface that defines erasure scheme methods.
+type ErasureScheme = improved.ErasureScheme
 
 // RedundancyStrategy is an ErasureScheme with a repair and optimal thresholds.
 type RedundancyStrategy struct {
@@ -286,7 +259,7 @@ func (er *EncodedRanger) Range(ctx context.Context, offset, length int64) (_ []i
 	for i, r := range readers {
 		// the offset might start a few bytes in, so we potentially have to
 		// discard the beginning bytes
-		_, err := io.CopyN(ioutil.Discard, r,
+		_, err := io.CopyN(io.Discard, r,
 			offset-firstBlock*int64(er.rs.ErasureShareSize()))
 		if err != nil {
 			return nil, Error.Wrap(err)

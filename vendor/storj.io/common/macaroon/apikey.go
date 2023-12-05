@@ -12,7 +12,7 @@ import (
 	"github.com/zeebo/errs"
 
 	"storj.io/common/base58"
-	"storj.io/common/pb"
+	"storj.io/picobuf"
 )
 
 // revoker is supplied when checking a macaroon for validation.
@@ -135,8 +135,7 @@ func (a *APIKey) Check(ctx context.Context, secret []byte, action Action, revoke
 	caveats := a.mac.Caveats()
 	for _, cavbuf := range caveats {
 		var cav Caveat
-		err := pb.Unmarshal(cavbuf, &cav)
-		if err != nil {
+		if err := cav.UnmarshalBinary(cavbuf); err != nil {
 			return ErrFormat.New("invalid caveat format")
 		}
 		if !cav.Allows(action) {
@@ -177,8 +176,7 @@ func (a *APIKey) GetAllowedBuckets(ctx context.Context, action Action) (allowed 
 	// intersection of all of the buckets in the allowed paths.
 	for _, cavbuf := range a.mac.Caveats() {
 		var cav Caveat
-		err := pb.Unmarshal(cavbuf, &cav)
-		if err != nil {
+		if err := cav.UnmarshalBinary(cavbuf); err != nil {
 			return AllowedBuckets{}, ErrFormat.New("invalid caveat format: %v", err)
 		}
 		if !cav.Allows(action) {
@@ -213,9 +211,27 @@ func (a *APIKey) GetAllowedBuckets(ctx context.Context, action Action) (allowed 
 	return allowed, err
 }
 
+// GetMaxObjectTTL returns the shortest MaxObjectTTL period conifgured in the APIKey's caveats.
+func (a *APIKey) GetMaxObjectTTL(ctx context.Context) (ttl *time.Duration, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	caveats := a.mac.Caveats()
+	for _, cavbuf := range caveats {
+		var cav Caveat
+		if err := cav.UnmarshalBinary(cavbuf); err != nil {
+			return nil, ErrFormat.New("invalid caveat format")
+		}
+		if cav.MaxObjectTtl != nil && (ttl == nil || *(cav.MaxObjectTtl) < *ttl) {
+			ttl = cav.MaxObjectTtl
+		}
+	}
+
+	return ttl, nil
+}
+
 // Restrict generates a new APIKey with the provided Caveat attached.
 func (a *APIKey) Restrict(caveat Caveat) (*APIKey, error) {
-	buf, err := pb.Marshal(&caveat)
+	buf, err := picobuf.Marshal(&caveat)
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}

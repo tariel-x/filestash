@@ -96,6 +96,9 @@ func (m *ListenMux) Run(ctx context.Context) error {
 		<-lis.done
 	}
 
+	_ = m.def.Close()
+	<-m.def.done
+
 	return m.err
 }
 

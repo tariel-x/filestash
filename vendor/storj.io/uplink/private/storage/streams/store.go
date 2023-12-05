@@ -7,7 +7,6 @@ import (
 	"context"
 	"crypto/rand"
 	"io"
-	"io/ioutil"
 	mathrand "math/rand" // Using mathrand here because crypto-graphic randomness is not required.
 	"sort"
 	"sync"
@@ -56,14 +55,11 @@ type Metadata interface {
 	Metadata() ([]byte, error)
 }
 
-// ETag interface returns the latest ETag for a part.
-type ETag interface {
-	ETag() []byte
-}
-
 // Store is a store for streams. It implements typedStore as part of an ongoing migration
 // to use typed paths. See the shim for the store that the rest of the world interacts with.
 type Store struct {
+	*Uploader
+
 	metainfo             *metaclient.Client
 	ec                   ecclient.Client
 	segmentSize          int64
@@ -76,7 +72,7 @@ type Store struct {
 }
 
 // NewStreamStore constructs a stream store.
-func NewStreamStore(metainfo *metaclient.Client, ec ecclient.Client, segmentSize int64, encStore *encryption.Store, encryptionParameters storj.EncryptionParameters, inlineThreshold int) (*Store, error) {
+func NewStreamStore(metainfo *metaclient.Client, ec ecclient.Client, segmentSize int64, encStore *encryption.Store, encryptionParameters storj.EncryptionParameters, inlineThreshold, longTailMargin int) (*Store, error) {
 	if segmentSize <= 0 {
 		return nil, errs.New("segment size must be larger than 0")
 	}
@@ -84,7 +80,16 @@ func NewStreamStore(metainfo *metaclient.Client, ec ecclient.Client, segmentSize
 		return nil, errs.New("encryption block size must be larger than 0")
 	}
 
+	// TODO: this is a hack for now. Once the new upload codepath is enabled
+	// by default, we can clean this up and stop embedding the uploader in
+	// the streams store.
+	uploader, err := NewUploader(metainfo, ec, segmentSize, encStore, encryptionParameters, inlineThreshold, longTailMargin)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Store{
+		Uploader:             uploader,
 		metainfo:             metainfo,
 		ec:                   ec,
 		segmentSize:          segmentSize,
@@ -174,6 +179,15 @@ func (s *Store) Put(ctx context.Context, bucket, unencryptedKey string, data io.
 			return Meta{}, errs.Wrap(err)
 		}
 
+		// note that we are *not* using the cipher suite from the encryption store, which
+		// might be encnull. we must make sure this actually encrypts here, otherwise the
+		// satellite will receive the decryption keys for all uploaded data.
+		// we also care that the storage nodes don't receive unencrypted data, even if
+		// paths are unencrypted.
+		if s.encryptionParameters.CipherSuite == storj.EncNull ||
+			s.encryptionParameters.CipherSuite == storj.EncNullBase64URL {
+			return Meta{}, errs.New("programmer error")
+		}
 		encryptedKey, err = encryption.EncryptKey(&contentKey, s.encryptionParameters.CipherSuite, derivedKey, &encryptedKeyNonce)
 		if err != nil {
 			return Meta{}, errs.Wrap(err)
@@ -187,12 +201,9 @@ func (s *Store) Put(ctx context.Context, bucket, unencryptedKey string, data io.
 			return Meta{}, errs.Wrap(err)
 		}
 
-		segmentEncryption := metaclient.SegmentEncryption{}
-		if s.encryptionParameters.CipherSuite != storj.EncNull {
-			segmentEncryption = metaclient.SegmentEncryption{
-				EncryptedKey:      encryptedKey,
-				EncryptedKeyNonce: encryptedKeyNonce,
-			}
+		segmentEncryption := metaclient.SegmentEncryption{
+			EncryptedKey:      encryptedKey,
+			EncryptedKeyNonce: encryptedKeyNonce,
 		}
 
 		if isRemote {
@@ -201,7 +212,7 @@ func (s *Store) Put(ctx context.Context, bucket, unencryptedKey string, data io.
 				return Meta{}, errs.Wrap(err)
 			}
 
-			paddedReader := encryption.PadReader(ioutil.NopCloser(peekReader), encrypter.InBlockSize())
+			paddedReader := encryption.PadReader(io.NopCloser(peekReader), encrypter.InBlockSize())
 			transformedReader := encryption.TransformReader(paddedReader, encrypter, 0)
 
 			beginSegment := &metaclient.BeginSegmentParams{
@@ -259,7 +270,7 @@ func (s *Store) Put(ctx context.Context, bucket, unencryptedKey string, data io.
 				UploadResult:      uploadResults,
 			})
 		} else {
-			data, err := ioutil.ReadAll(peekReader)
+			data, err := io.ReadAll(peekReader)
 			if err != nil {
 				return Meta{}, errs.Wrap(err)
 			}
@@ -312,8 +323,8 @@ func (s *Store) Put(ctx context.Context, bucket, unencryptedKey string, data io.
 		return Meta{}, errs.Wrap(err)
 	}
 
-	// TODO: Do we still need to set SegmentsSize and LastSegmentSize
-	// for backward compatibility with old uplinks?
+	// We still need SegmentsSize and LastSegmentSize for backward
+	// compatibility with old uplinks.
 	streamInfo, err := pb.Marshal(&pb.StreamInfo{
 		SegmentsSize:    s.segmentSize,
 		LastSegmentSize: lastSegmentSize,
@@ -371,7 +382,7 @@ func (s *Store) Put(ctx context.Context, bucket, unencryptedKey string, data io.
 }
 
 // PutPart uploads single part.
-func (s *Store) PutPart(ctx context.Context, bucket, unencryptedKey string, streamID storj.StreamID, partNumber uint32, eTag ETag, data io.Reader) (_ Part, err error) {
+func (s *Store) PutPart(ctx context.Context, bucket, unencryptedKey string, streamID storj.StreamID, partNumber uint32, eTagCh <-chan []byte, data io.Reader) (_ Part, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	var (
@@ -449,7 +460,7 @@ func (s *Store) PutPart(ctx context.Context, bucket, unencryptedKey string, stre
 				return Part{}, errs.Wrap(err)
 			}
 
-			paddedReader := encryption.PadReader(ioutil.NopCloser(peekReader), encrypter.InBlockSize())
+			paddedReader := encryption.PadReader(io.NopCloser(peekReader), encrypter.InBlockSize())
 			transformedReader := encryption.TransformReader(paddedReader, encrypter, 0)
 
 			beginSegment := metaclient.BeginSegmentParams{
@@ -497,7 +508,7 @@ func (s *Store) PutPart(ctx context.Context, bucket, unencryptedKey string, stre
 				UploadResult:      uploadResults,
 			})
 		} else {
-			data, err := ioutil.ReadAll(peekReader)
+			data, err := io.ReadAll(peekReader)
 			if err != nil {
 				return Part{}, errs.Wrap(err)
 			}
@@ -528,8 +539,15 @@ func (s *Store) PutPart(ctx context.Context, bucket, unencryptedKey string, stre
 		currentSegment++
 	}
 
+	var eTag []byte
+	select {
+	case eTag = <-eTagCh:
+	case <-ctx.Done():
+		return Part{}, ctx.Err()
+	}
+
 	// store ETag only for last segment in a part
-	encryptedTag, err := encryptETag(eTag.ETag(), s.encryptionParameters, &lastSegmentContentKey)
+	encryptedTag, err := encryptETag(eTag, s.encryptionParameters, &lastSegmentContentKey)
 	if err != nil {
 		return Part{}, errs.Wrap(err)
 	}
@@ -552,7 +570,7 @@ func (s *Store) PutPart(ctx context.Context, bucket, unencryptedKey string, stre
 	return Part{
 		PartNumber: partNumber,
 		Size:       streamSize,
-		ETag:       eTag.ETag(), // return plain ETag
+		ETag:       eTag, // return plain ETag
 	}, nil
 }
 
@@ -821,7 +839,7 @@ func decryptRanger(ctx context.Context, rr ranger.Ranger, plainSize int64, encry
 			return nil, err
 		}
 		defer func() { err = errs.Combine(err, reader.Close()) }()
-		cipherData, err := ioutil.ReadAll(reader)
+		cipherData, err := io.ReadAll(reader)
 		if err != nil {
 			return nil, err
 		}

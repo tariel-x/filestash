@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"time"
 
 	"github.com/zeebo/errs"
@@ -17,6 +18,9 @@ import (
 	"storj.io/common/rpc"
 	"storj.io/common/storj"
 )
+
+// NoiseEnabled indicates whether Noise is enabled in this build.
+var NoiseEnabled = os.Getenv("STORJ_NOISE_DISABLED_EXPERIMENTAL") != "true"
 
 var errMessageTimeout = errors.New("message timeout")
 
@@ -35,9 +39,11 @@ var (
 // Config defines piecestore client parameters for upload and download.
 type Config struct {
 	DownloadBufferSize int64
+	UploadBufferSize   int64
 
-	InitialStep int64
-	MaximumStep int64
+	InitialStep      int64
+	MaximumStep      int64
+	MaximumChunkSize int32
 
 	MessageTimeout time.Duration
 }
@@ -45,18 +51,23 @@ type Config struct {
 // DefaultConfig are the default params used for upload and download.
 var DefaultConfig = Config{
 	DownloadBufferSize: 256 * memory.KiB.Int64(),
+	UploadBufferSize:   64 * memory.KiB.Int64(),
 
-	InitialStep: 64 * memory.KiB.Int64(),
-	MaximumStep: 256 * memory.KiB.Int64(),
+	InitialStep:      256 * memory.KiB.Int64(),
+	MaximumStep:      550 * memory.KiB.Int64(),
+	MaximumChunkSize: 16 * memory.KiB.Int32(),
 
 	MessageTimeout: 10 * time.Minute,
 }
 
 // Client implements uploading, downloading and deleting content from a piecestore.
 type Client struct {
-	client pb.DRPCPiecestoreClient
-	conn   *rpc.Conn
-	config Config
+	client         pb.DRPCPiecestoreClient
+	replaySafe     pb.DRPCReplaySafePiecestoreClient
+	nodeURL        storj.NodeURL
+	conn           *rpc.Conn
+	config         Config
+	UploadHashAlgo pb.PieceHashAlgorithm
 }
 
 // Dial dials the target piecestore endpoint.
@@ -67,10 +78,27 @@ func Dial(ctx context.Context, dialer rpc.Dialer, nodeURL storj.NodeURL, config 
 	}
 
 	return &Client{
-		client: pb.NewDRPCPiecestoreClient(conn),
-		conn:   conn,
-		config: config,
+		client:  pb.NewDRPCPiecestoreClient(conn),
+		nodeURL: nodeURL,
+		conn:    conn,
+		config:  config,
 	}, nil
+}
+
+// DialReplaySafe dials the target piecestore endpoint for replay safe request types.
+func DialReplaySafe(ctx context.Context, dialer rpc.Dialer, nodeURL storj.NodeURL, config Config) (*Client, error) {
+	conn, err := dialer.DialNode(ctx, nodeURL, rpc.DialOptions{ReplaySafe: NoiseEnabled})
+	if err != nil {
+		return nil, Error.Wrap(err)
+	}
+
+	return &Client{
+		replaySafe: pb.NewDRPCReplaySafePiecestoreClient(conn),
+		nodeURL:    nodeURL,
+		conn:       conn,
+		config:     config,
+	}, nil
+
 }
 
 // Retain uses a bloom filter to tell the piece store which pieces to keep.
@@ -85,13 +113,17 @@ func (client *Client) Close() error {
 	return client.conn.Close()
 }
 
-// GetPeerIdentity gets the connection's peer identity.
+// GetPeerIdentity gets the connection's peer identity. This doesn't work
+// on Noise-based connections.
 func (client *Client) GetPeerIdentity() (*identity.PeerIdentity, error) {
 	return client.conn.PeerIdentity()
 }
 
+// NodeURL returns the Node we dialed.
+func (client *Client) NodeURL() storj.NodeURL { return client.nodeURL }
+
 // next allocation step find the next trusted step.
-func (client *Client) nextAllocationStep(previous int64) int64 {
+func (client *Client) nextOrderStep(previous int64) int64 {
 	// TODO: ensure that this is frame idependent
 	next := previous * 3 / 2
 	if next > client.config.MaximumStep {

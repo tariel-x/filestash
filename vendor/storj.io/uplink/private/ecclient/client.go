@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"io/ioutil"
 	"sort"
 	"strconv"
 	"sync"
@@ -18,7 +17,6 @@ import (
 
 	"storj.io/common/encryption"
 	"storj.io/common/errs2"
-	"storj.io/common/identity"
 	"storj.io/common/pb"
 	"storj.io/common/ranger"
 	"storj.io/common/rpc"
@@ -35,7 +33,7 @@ type Client interface {
 	Get(ctx context.Context, limits []*pb.AddressedOrderLimit, privateKey storj.PiecePrivateKey, es eestream.ErasureScheme, size int64) (ranger.Ranger, error)
 	WithForceErrorDetection(force bool) Client
 	// PutPiece is not intended to be used by normal uplinks directly, but is exported to support storagenode graceful exit transfers.
-	PutPiece(ctx, parent context.Context, limit *pb.AddressedOrderLimit, privateKey storj.PiecePrivateKey, data io.ReadCloser) (hash *pb.PieceHash, id *identity.PeerIdentity, err error)
+	PutPiece(ctx, parent context.Context, limit *pb.AddressedOrderLimit, privateKey storj.PiecePrivateKey, data io.ReadCloser) (hash *pb.PieceHash, id *struct{}, err error)
 }
 
 type dialPiecestoreFunc func(context.Context, storj.NodeURL) (*piecestore.Client, error)
@@ -48,6 +46,7 @@ type ecClient struct {
 
 // New creates a client from the given dialer and max buffer memory.
 func New(dialer rpc.Dialer, memoryLimit int) Client {
+
 	return &ecClient{
 		dialer:      dialer,
 		memoryLimit: memoryLimit,
@@ -60,7 +59,13 @@ func (ec *ecClient) WithForceErrorDetection(force bool) Client {
 }
 
 func (ec *ecClient) dialPiecestore(ctx context.Context, n storj.NodeURL) (*piecestore.Client, error) {
-	return piecestore.Dial(ctx, ec.dialer, n, piecestore.DefaultConfig)
+	hashAlgo := piecestore.GetPieceHashAlgo(ctx)
+	client, err := piecestore.DialReplaySafe(ctx, ec.dialer, n, piecestore.DefaultConfig)
+	if err != nil {
+		return client, err
+	}
+	client.UploadHashAlgo = hashAlgo
+	return client, nil
 }
 
 func (ec *ecClient) PutSingleResult(ctx context.Context, limits []*pb.AddressedOrderLimit, privateKey storj.PiecePrivateKey, rs eestream.RedundancyStrategy, data io.Reader) (results []*pb.SegmentPieceUploadResult, err error) {
@@ -111,7 +116,7 @@ func (ec *ecClient) put(ctx context.Context, limits []*pb.AddressedOrderLimit, p
 		return nil, nil, Error.New("duplicated nodes are not allowed")
 	}
 
-	padded := encryption.PadReader(ioutil.NopCloser(data), rs.StripeSize())
+	padded := encryption.PadReader(io.NopCloser(data), rs.StripeSize())
 	readers, err := eestream.EncodeReader2(ctx, padded, rs)
 	if err != nil {
 		return nil, nil, err
@@ -197,7 +202,7 @@ func (ec *ecClient) put(ctx context.Context, limits []*pb.AddressedOrderLimit, p
 	return successfulNodes, successfulHashes, nil
 }
 
-func (ec *ecClient) PutPiece(ctx, parent context.Context, limit *pb.AddressedOrderLimit, privateKey storj.PiecePrivateKey, data io.ReadCloser) (hash *pb.PieceHash, peerID *identity.PeerIdentity, err error) {
+func (ec *ecClient) PutPiece(ctx, parent context.Context, limit *pb.AddressedOrderLimit, privateKey storj.PiecePrivateKey, data io.ReadCloser) (hash *pb.PieceHash, deprecated *struct{}, err error) {
 	nodeName := "nil"
 	if limit != nil {
 		nodeName = limit.GetLimit().StorageNodeId.String()[0:8]
@@ -206,15 +211,12 @@ func (ec *ecClient) PutPiece(ctx, parent context.Context, limit *pb.AddressedOrd
 	defer func() { err = errs.Combine(err, data.Close()) }()
 
 	if limit == nil {
-		_, _ = io.Copy(ioutil.Discard, data)
+		_, _ = io.Copy(io.Discard, data)
 		return nil, nil, nil
 	}
 
 	storageNodeID := limit.GetLimit().StorageNodeId
-	ps, err := ec.dialPiecestore(ctx, storj.NodeURL{
-		ID:      storageNodeID,
-		Address: limit.GetStorageNodeAddress().Address,
-	})
+	ps, err := ec.dialPiecestore(ctx, limitToNodeURL(limit))
 	if err != nil {
 		return nil, nil, Error.New("failed to dial (node:%v): %w", storageNodeID, err)
 	}
@@ -245,13 +247,7 @@ func (ec *ecClient) PutPiece(ctx, parent context.Context, limit *pb.AddressedOrd
 		return nil, nil, err
 	}
 
-	peerID, err = ps.GetPeerIdentity()
-	if err != nil {
-		err = Error.New("failed getting peer identity (node:%v): %w", storageNodeID, err)
-		return nil, nil, err
-	}
-
-	return hash, peerID, nil
+	return hash, nil, nil
 }
 
 func (ec *ecClient) Get(ctx context.Context, limits []*pb.AddressedOrderLimit, privateKey storj.PiecePrivateKey, es eestream.ErasureScheme, size int64) (rr ranger.Ranger, err error) {
@@ -403,13 +399,19 @@ func (lr *lazyPieceReader) dial() error {
 	return nil
 }
 
-func (lr *lazyPieceRanger) dial(ctx context.Context, offset, length int64) (_ *piecestore.Client, _ *piecestore.Download, err error) {
-	defer mon.Task()(&ctx)(&err)
+func limitToNodeURL(limit *pb.AddressedOrderLimit) storj.NodeURL {
+	return (&pb.Node{
+		Id:      limit.GetLimit().StorageNodeId,
+		Address: limit.GetStorageNodeAddress(),
+	}).NodeURL()
+}
 
-	ps, err := lr.dialPiecestore(ctx, storj.NodeURL{
-		ID:      lr.limit.GetLimit().StorageNodeId,
-		Address: lr.limit.GetStorageNodeAddress().Address,
-	})
+var monLazyPieceRangerDialTask = mon.Task()
+
+func (lr *lazyPieceRanger) dial(ctx context.Context, offset, length int64) (_ *piecestore.Client, _ *piecestore.Download, err error) {
+	defer monLazyPieceRangerDialTask(&ctx)(&err)
+
+	ps, err := lr.dialPiecestore(ctx, limitToNodeURL(lr.limit))
 	if err != nil {
 		return nil, nil, err
 	}

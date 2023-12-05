@@ -14,9 +14,6 @@ const (
 	// kindReserved is saved for the future in case we need to extend.
 	//   kindReserved Kind = 0
 
-	// kindCancelDeprecated is a reminder that we once used this kind value.
-	//   kindCancelDeprecated Kind = 4
-
 	// KindInvoke is used to invoke an rpc. The body is the name of the rpc.
 	KindInvoke Kind = 1
 
@@ -26,6 +23,9 @@ const (
 	// KindError is used to inform that an error happened. The body is an error
 	// with a code attached.
 	KindError Kind = 3
+
+	// KindCancel is sent to notify the remote that we have soft canceled.
+	KindCancel Kind = 4
 
 	// KindClose is used to inform that the rpc is dead. It has no body.
 	KindClose Kind = 5
@@ -157,6 +157,12 @@ type Packet struct {
 
 	// Kind is the kind of the packet.
 	Kind Kind
+
+	// Control is set to true for packets that are
+	// forwards compatible. Unknown or invalid packets
+	// with the control bool set should be ignored
+	// instead of triggering any errors.
+	Control bool
 }
 
 // String returns a human readable form of the packet.

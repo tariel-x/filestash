@@ -51,6 +51,12 @@ type Permission struct {
 	// believes the time is after NotAfter.
 	// If set, this value should always be after NotBefore.
 	NotAfter time.Time
+	// MaxObjectTTL restricts the maximum time-to-live of objects.
+	// If set, new objects are uploaded with an expiration time that reflects
+	// the MaxObjectTTL period.
+	// If objects are uploaded with an explicit expiration time, the upload
+	// will be successful only if it is shorter than the MaxObjectTTL period.
+	MaxObjectTTL *time.Duration
 }
 
 // Restrict creates a new access grant with specific permissions.
@@ -78,6 +84,10 @@ func (access *Access) Restrict(permission Permission, prefixes ...SharePrefix) (
 		return nil, errors.New("invalid time range")
 	}
 
+	if permission.MaxObjectTTL != nil && *(permission.MaxObjectTTL) <= 0 {
+		return nil, errors.New("non-positive ttl period")
+	}
+
 	caveat := macaroon.WithNonce(macaroon.Caveat{
 		DisallowReads:   !permission.AllowDownload,
 		DisallowWrites:  !permission.AllowUpload,
@@ -85,13 +95,8 @@ func (access *Access) Restrict(permission Permission, prefixes ...SharePrefix) (
 		DisallowDeletes: !permission.AllowDelete,
 		NotBefore:       notBefore,
 		NotAfter:        notAfter,
+		MaxObjectTtl:    permission.MaxObjectTTL,
 	})
-
-	encAccess := NewEncryptionAccess()
-	encAccess.SetDefaultPathCipher(access.EncAccess.Store.GetDefaultPathCipher())
-	if len(prefixes) == 0 {
-		encAccess.SetDefaultKey(access.EncAccess.Store.GetDefaultKey())
-	}
 
 	for _, prefix := range prefixes {
 		// If the share prefix ends in a `/` we need to remove this final slash.
@@ -104,14 +109,7 @@ func (access *Access) Restrict(permission Permission, prefixes ...SharePrefix) (
 		if err != nil {
 			return nil, err
 		}
-		derivedKey, err := encryption.DerivePathKey(prefix.Bucket, unencPath, access.EncAccess.Store)
-		if err != nil {
-			return nil, err
-		}
 
-		if err := encAccess.Store.Add(prefix.Bucket, unencPath, encPath, *derivedKey); err != nil {
-			return nil, err
-		}
 		caveat.AllowedPaths = append(caveat.AllowedPaths, &macaroon.Caveat_Path{
 			Bucket:              []byte(prefix.Bucket),
 			EncryptedPathPrefix: []byte(encPath.Raw()),
@@ -123,10 +121,12 @@ func (access *Access) Restrict(permission Permission, prefixes ...SharePrefix) (
 		return nil, err
 	}
 
-	restrictedAccess := &Access{
+	encAccess := access.EncAccess.Clone()
+	encAccess.LimitTo(restrictedAPIKey)
+
+	return &Access{
 		SatelliteAddress: access.SatelliteAddress,
 		APIKey:           restrictedAPIKey,
 		EncAccess:        encAccess,
-	}
-	return restrictedAccess, nil
+	}, nil
 }

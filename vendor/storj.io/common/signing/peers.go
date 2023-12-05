@@ -16,6 +16,9 @@ import (
 
 var mon = monkit.Package()
 
+var publicKeyHashAndVerifySignatureMon = mon.Task()
+var privateKeyHashAndVerifySignatureMon = mon.Task()
+
 // PrivateKey implements a signer and signee using a crypto.PrivateKey.
 type PrivateKey struct {
 	Self storj.NodeID
@@ -41,7 +44,7 @@ func (private *PrivateKey) HashAndSign(ctx context.Context, data []byte) (_ []by
 
 // HashAndVerifySignature hashes the data and verifies that the signature belongs to the PrivateKey.
 func (private *PrivateKey) HashAndVerifySignature(ctx context.Context, data, signature []byte) (err error) {
-	defer mon.Task()(&ctx)(&err)
+	defer privateKeyHashAndVerifySignatureMon(&ctx)(&err)
 	pub, err := pkcrypto.PublicKeyFromPrivate(private.Key)
 	if err != nil {
 		return err
@@ -81,6 +84,7 @@ func (public *PublicKey) ID() storj.NodeID { return public.Self }
 
 // HashAndVerifySignature hashes the data and verifies that the signature belongs to the PublicKey.
 func (public *PublicKey) HashAndVerifySignature(ctx context.Context, data, signature []byte) (err error) {
-	defer mon.Task()(&ctx)(&err)
+	defer publicKeyHashAndVerifySignatureMon(&ctx)(&err)
+
 	return pkcrypto.HashAndVerifySignature(public.Key, data, signature)
 }

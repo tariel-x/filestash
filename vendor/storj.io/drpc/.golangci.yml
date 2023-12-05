@@ -11,7 +11,6 @@ run:
 linters:
   enable:
     - bodyclose               # find unclosed http response bodies
-    - deadcode                # find code that is not used
     - dogsled                 # checks for too many ignored arguments
     - durationcheck           # verifies whether durations are multiplied, usually a mistake
     - errcheck                # find unchecked errors
@@ -32,10 +31,7 @@ linters:
     - noctx                   # finds locations that should use context
     - nolintlint              # checks that nolint directives are correct
     - revive                  # check standard linting rules
-    - staticcheck             # comprehensive checks
-    - structcheck             # check for unused struct parameters
     - unconvert               # remove unnecessary conversions
-    - varcheck                # find unused global variables and constants
     - wastedassign
     #TODO#- forcetypeassert   # needs work to replace unchecked interface type assertion
     #TODO#- gochecknoglobals  # needs work to remove globals
@@ -75,6 +71,7 @@ linters:
     - promlinter       # not relevant
     - rowserrcheck     # checks if sql.Rows.Err is checked correctly - Disabled  because it reports false positive with defer statements after Query call
     - sqlclosecheck    # we have tagsql, which checks this better
+    - staticcheck      # we use the separate staticcheck binary already
     - stylecheck       # has false positives
     - tagliatelle      # not our style
     - testpackage      # sometimes it's useful to have tests on private funcs
@@ -170,3 +167,9 @@ issues:
     - linters:
         - revive
       text: "if-return"
+    - linters:
+        - revive
+      text: "unused-parameter" # too many false positives
+    - linters:
+        - revive
+      text: "redefines-builtin-id" # too many false positives

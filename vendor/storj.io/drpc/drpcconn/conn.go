@@ -57,6 +57,13 @@ func (c *Conn) Closed() <-chan struct{} {
 	return c.man.Closed()
 }
 
+// Unblocked returns a channel that is closed once the connection is no longer
+// blocked by a previously canceled Invoke or NewStream call. It should not
+// be called concurrently with Invoke or NewStream.
+func (c *Conn) Unblocked() <-chan struct{} {
+	return c.man.Unblocked()
+}
+
 // Close closes the connection.
 func (c *Conn) Close() (err error) {
 	return c.man.Close()
@@ -147,9 +154,6 @@ func (c *Conn) doNewStream(stream *drpcstream.Stream, rpc string, metadata []byt
 		}
 	}
 	if err := stream.RawWrite(drpcwire.KindInvoke, []byte(rpc)); err != nil {
-		return err
-	}
-	if err := stream.RawFlush(); err != nil {
 		return err
 	}
 	return nil

@@ -4,9 +4,12 @@
 package drpcwire
 
 import (
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
+
+	"storj.io/drpc/drpcdebug"
 )
 
 //
@@ -36,6 +39,12 @@ func NewWriter(w io.Writer, size int) *Writer {
 	}
 }
 
+func (b *Writer) log(what string, cb func() string) {
+	if drpcdebug.Enabled {
+		drpcdebug.Log(func() (_, _, _ string) { return fmt.Sprintf("<wri %p>", b), what, cb() })
+	}
+}
+
 // WritePacket writes the packet as a single frame, ignoring any size
 // constraints.
 func (b *Writer) WritePacket(pkt Packet) (err error) {
@@ -55,8 +64,10 @@ func (b *Writer) Empty() bool {
 // Reset clears any pending data in the buffer.
 func (b *Writer) Reset() *Writer {
 	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	b.buf = b.buf[:0]
-	b.mu.Unlock()
+	atomic.StoreUint32(&b.empty, 0)
 	return b
 }
 
@@ -64,16 +75,18 @@ func (b *Writer) Reset() *Writer {
 // than the configured size, flushes it.
 func (b *Writer) WriteFrame(fr Frame) (err error) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	if len(b.buf) == 0 {
 		atomic.StoreUint32(&b.empty, 1)
 	}
 	b.buf = AppendFrame(b.buf, fr)
 	if len(b.buf) >= b.size {
+		b.log("FLUSH", func() string { return fmt.Sprintf("buffer: %d > %d", len(b.buf), b.size) })
 		_, err = b.w.Write(b.buf)
 		b.buf = b.buf[:0]
 		atomic.StoreUint32(&b.empty, 0)
 	}
-	b.mu.Unlock()
 	return err
 }
 
@@ -81,11 +94,13 @@ func (b *Writer) WriteFrame(fr Frame) (err error) {
 // there is no data in the buffer.
 func (b *Writer) Flush() (err error) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	if len(b.buf) > 0 {
 		_, err = b.w.Write(b.buf)
+		b.log("FLUSH", func() string { return fmt.Sprintf("explicit: %d", len(b.buf)) })
 		b.buf = b.buf[:0]
 		atomic.StoreUint32(&b.empty, 0)
 	}
-	b.mu.Unlock()
 	return err
 }

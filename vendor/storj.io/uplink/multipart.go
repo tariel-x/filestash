@@ -1,4 +1,4 @@
-// Copyright (C) 2021 Storj Labs, Inc.
+// Copyright (C) 2023 Storj Labs, Inc.
 // See LICENSE for copying information.
 
 package uplink
@@ -8,25 +8,30 @@ import (
 	"crypto/rand"
 	"errors"
 	"math"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/jtolio/eventkit"
 	"github.com/zeebo/errs"
 
 	"storj.io/common/base58"
 	"storj.io/common/encryption"
+	"storj.io/common/leak"
 	"storj.io/common/pb"
 	"storj.io/common/storj"
+	"storj.io/uplink/private/eestream/scheduler"
 	"storj.io/uplink/private/metaclient"
 	"storj.io/uplink/private/storage/streams"
 	"storj.io/uplink/private/stream"
+	"storj.io/uplink/private/testuplink"
 )
 
 // ErrUploadIDInvalid is returned when the upload ID is invalid.
 var ErrUploadIDInvalid = errors.New("upload ID invalid")
 
-// UploadInfo contains information about multipart upload.
+// UploadInfo contains information about an upload.
 type UploadInfo struct {
 	UploadID string
 	Key      string
@@ -40,14 +45,6 @@ type UploadInfo struct {
 // CommitUploadOptions options for committing multipart upload.
 type CommitUploadOptions struct {
 	CustomMetadata CustomMetadata
-}
-
-type etag struct {
-	upload *PartUpload
-}
-
-func (etag etag) ETag() []byte {
-	return etag.upload.etag
 }
 
 // BeginUpload begins a new multipart upload to bucket and key.
@@ -226,7 +223,24 @@ func (project *Project) fillMetadata(bucket, key string, id storj.StreamID, meta
 // UploadPart uploads a part with partNumber to a multipart upload started with BeginUpload.
 //
 // uploadID is an upload identifier returned by BeginUpload.
-func (project *Project) UploadPart(ctx context.Context, bucket, key, uploadID string, partNumber uint32) (upload *PartUpload, err error) {
+func (project *Project) UploadPart(ctx context.Context, bucket, key, uploadID string, partNumber uint32) (_ *PartUpload, err error) {
+	upload := &PartUpload{
+		bucket: bucket,
+		key:    key,
+		part: &Part{
+			PartNumber: partNumber,
+		},
+		stats:  newOperationStats(ctx, project.access.satelliteURL),
+		eTagCh: make(chan []byte, 1),
+	}
+	upload.task = mon.TaskNamed("PartUpload")(&ctx)
+	defer func() {
+		if err != nil {
+			upload.stats.flagFailure(err)
+			upload.emitEvent(false)
+		}
+	}()
+	defer upload.stats.trackWorking()()
 	defer mon.Task()(&ctx)(&err)
 
 	switch {
@@ -245,25 +259,31 @@ func (project *Project) UploadPart(ctx context.Context, bucket, key, uploadID st
 		return nil, packageError.Wrap(ErrUploadIDInvalid)
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
-
-	upload = &PartUpload{
-		cancel: cancel,
-		bucket: bucket,
-		key:    key,
-		part: &Part{
-			PartNumber: partNumber,
-		},
+	if encPath, err := encryptPath(project, bucket, key); err == nil {
+		upload.stats.encPath = encPath
 	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	upload.cancel = cancel
 
 	streams, err := project.getStreamsStore(ctx)
 	if err != nil {
 		return nil, convertKnownErrors(err, bucket, key)
 	}
-
 	upload.streams = streams
-	upload.upload = stream.NewUploadPart(ctx, bucket, key, decodedStreamID, partNumber, etag{upload}, streams)
 
+	if project.concurrentSegmentUploadConfig == nil {
+		upload.upload = stream.NewUploadPart(ctx, bucket, key, decodedStreamID, partNumber, upload.eTagCh, streams)
+	} else {
+		sched := scheduler.New(project.concurrentSegmentUploadConfig.SchedulerOptions)
+		u, err := streams.UploadPart(ctx, bucket, key, decodedStreamID, int32(partNumber), upload.eTagCh, sched)
+		if err != nil {
+			return nil, convertKnownErrors(err, bucket, key)
+		}
+		upload.upload = u
+	}
+
+	upload.tracker = project.tracker.Child("upload-part", 1)
 	return upload, nil
 }
 
@@ -362,6 +382,8 @@ func (project *Project) ListUploadParts(ctx context.Context, bucket, key, upload
 }
 
 // ListUploads returns an iterator over the uncommitted uploads in bucket.
+// Both multipart and regular uploads are returned. An object may not be
+// visible through ListUploads until it has a committed part.
 func (project *Project) ListUploads(ctx context.Context, bucket string, options *ListUploadsOptions) *UploadIterator {
 	defer mon.Task()(&ctx)(nil)
 
@@ -377,6 +399,8 @@ func (project *Project) ListUploads(ctx context.Context, bucket string, options 
 		opts.IncludeSystemMetadata = options.System
 		opts.IncludeCustomMetadata = options.Custom
 	}
+
+	opts.Limit = testuplink.GetListLimit(ctx)
 
 	uploads := UploadIterator{
 		ctx:     ctx,
@@ -413,26 +437,41 @@ type PartUpload struct {
 	closed  bool
 	aborted bool
 	cancel  context.CancelFunc
-	upload  *stream.PartUpload
+	upload  streamUpload
 	bucket  string
 	key     string
 	part    *Part
 	streams *streams.Store
-	etag    []byte
+	eTagCh  chan []byte
+
+	stats operationStats
+	task  func(*error)
+
+	tracker leak.Ref
 }
 
 // Write uploads len(p) bytes from p to the object's data stream.
 // It returns the number of bytes written from p (0 <= n <= len(p))
 // and any error encountered that caused the write to stop early.
 func (upload *PartUpload) Write(p []byte) (int, error) {
+	track := upload.stats.trackWorking()
 	n, err := upload.upload.Write(p)
+	upload.mu.Lock()
+	upload.stats.bytes += int64(n)
+	upload.stats.flagFailure(err)
+	track()
+	upload.mu.Unlock()
 	return n, convertKnownErrors(err, upload.bucket, upload.key)
 }
 
 // SetETag sets ETag for a part.
-func (upload *PartUpload) SetETag(etag []byte) error {
+func (upload *PartUpload) SetETag(eTag []byte) error {
 	upload.mu.Lock()
 	defer upload.mu.Unlock()
+
+	if upload.part.ETag != nil {
+		return packageError.New("etag already set")
+	}
 
 	if upload.aborted {
 		return errwrapf("%w: upload aborted", ErrUploadDone)
@@ -441,7 +480,8 @@ func (upload *PartUpload) SetETag(etag []byte) error {
 		return errwrapf("%w: already committed", ErrUploadDone)
 	}
 
-	upload.etag = etag
+	upload.part.ETag = eTag
+	upload.eTagCh <- eTag
 	return nil
 }
 
@@ -449,6 +489,7 @@ func (upload *PartUpload) SetETag(etag []byte) error {
 //
 // Returns ErrUploadDone when either Abort or Commit has already been called.
 func (upload *PartUpload) Commit() error {
+	track := upload.stats.trackWorking()
 	upload.mu.Lock()
 	defer upload.mu.Unlock()
 
@@ -462,10 +503,21 @@ func (upload *PartUpload) Commit() error {
 
 	upload.closed = true
 
+	// ETag must not be sent after a call to commit. The upload code waits on
+	// the channel before committing the last segment. Closing the channel
+	// allows the upload code to unblock if no eTag has been set. Not all
+	// multipart uploaders care about setting the eTag so we can't assume it
+	// has been set.
+	close(upload.eTagCh)
+
 	err := errs.Combine(
-		upload.upload.Close(),
+		upload.upload.Commit(),
 		upload.streams.Close(),
+		upload.tracker.Close(),
 	)
+	upload.stats.flagFailure(err)
+	track()
+	upload.emitEvent(false)
 
 	return convertKnownErrors(err, upload.bucket, upload.key)
 }
@@ -474,6 +526,7 @@ func (upload *PartUpload) Commit() error {
 //
 // Returns ErrUploadDone when either Abort or Commit has already been called.
 func (upload *PartUpload) Abort() error {
+	track := upload.stats.trackWorking()
 	upload.mu.Lock()
 	defer upload.mu.Unlock()
 
@@ -491,18 +544,43 @@ func (upload *PartUpload) Abort() error {
 	err := errs.Combine(
 		upload.upload.Abort(),
 		upload.streams.Close(),
+		upload.tracker.Close(),
 	)
+	upload.stats.flagFailure(err)
+	track()
+	upload.emitEvent(true)
 
 	return convertKnownErrors(err, upload.bucket, upload.key)
 }
 
 // Info returns the last information about the uploaded part.
 func (upload *PartUpload) Info() *Part {
-	part := upload.upload.Part()
-	if part != nil {
-		upload.part.Size = part.Size
-		upload.part.Modified = part.Modified
-		upload.part.ETag = part.ETag
+	if meta := upload.upload.Meta(); meta != nil {
+		upload.part.Size = meta.Size
+		upload.part.Modified = meta.Modified
 	}
 	return upload.part
+}
+
+func (upload *PartUpload) emitEvent(aborted bool) {
+	message, err := upload.stats.err()
+	upload.task(&err)
+
+	evs.Event("part-upload",
+		eventkit.Int64("bytes", upload.stats.bytes),
+		eventkit.Duration("user-elapsed", time.Since(upload.stats.start)),
+		eventkit.Duration("working-elapsed", upload.stats.working),
+		eventkit.Bool("success", err == nil),
+		eventkit.String("error", message),
+		eventkit.Bool("aborted", aborted),
+		eventkit.String("arch", runtime.GOARCH),
+		eventkit.String("os", runtime.GOOS),
+		eventkit.Int64("cpus", int64(runtime.NumCPU())),
+		eventkit.Int64("quic-rollout", int64(upload.stats.quicRollout)),
+		eventkit.String("satellite", upload.stats.satellite),
+		eventkit.Bytes("path-checksum", pathChecksum(upload.stats.encPath)),
+		eventkit.Int64("noise-version", noiseVersion),
+		// segment count
+		// ram available
+	)
 }

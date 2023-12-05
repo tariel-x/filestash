@@ -10,10 +10,11 @@ import (
 	"io"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/spacemonkeygo/monkit/v3"
-	"github.com/vivint/infectious"
+
+	"storj.io/common/rpc/rpctracing"
+	"storj.io/infectious"
 )
 
 var (
@@ -23,7 +24,7 @@ var (
 // StripeReader can read and decodes stripes from a set of readers.
 type StripeReader struct {
 	scheme              ErasureScheme
-	cond                *sync.Cond
+	newData             chan struct{}
 	readerCount         int
 	bufs                map[int]*PieceBuffer
 	inbufs              map[int][]byte
@@ -39,7 +40,7 @@ func NewStripeReader(rs map[int]io.ReadCloser, es ErasureScheme, mbm int, forceE
 
 	r := &StripeReader{
 		scheme:              es,
-		cond:                sync.NewCond(&sync.Mutex{}),
+		newData:             make(chan struct{}, 1),
 		readerCount:         readerCount,
 		bufs:                make(map[int]*PieceBuffer, readerCount),
 		inbufs:              make(map[int][]byte, readerCount),
@@ -56,7 +57,7 @@ func NewStripeReader(rs map[int]io.ReadCloser, es ErasureScheme, mbm int, forceE
 
 	for i := range rs {
 		r.inbufs[i] = make([]byte, es.ErasureShareSize())
-		r.bufs[i] = NewPieceBuffer(make([]byte, bufSize), es.ErasureShareSize(), r.cond)
+		r.bufs[i] = NewPieceBuffer(make([]byte, bufSize), es.ErasureShareSize(), r.newData)
 		// Kick off a goroutine each reader to be copied into a PieceBuffer.
 		go func(r io.Reader, buf *PieceBuffer) {
 			_, err := io.Copy(buf, r)
@@ -90,43 +91,49 @@ func (r *StripeReader) Close() error {
 }
 
 var backcompatMon = monkit.ScopeNamed("storj.io/storj/uplink/eestream")
+var monReadStripeTask = mon.Task()
 
-// ReadStripe reads and decodes the num-th stripe and concatenates it to p. The
-// return value is the updated byte slice.
-func (r *StripeReader) ReadStripe(ctx context.Context, num int64, p []byte) (_ []byte, err error) {
-	defer mon.Task()(&ctx, num)(&err)
+// ReadStripes reads and decodes the next stripes and concatenates them to p. The
+// return value is the updated byte slice and the number of stripes.
+func (r *StripeReader) ReadStripes(ctx context.Context, num int64, p []byte) (_ []byte, _ int, err error) {
+	defer monReadStripeTask(&ctx, num)(&err)
+	ctx = rpctracing.WithoutDistributedTracing(ctx)
 
 	for i := range r.inmap {
 		delete(r.inmap, i)
 	}
 
-	r.cond.L.Lock()
-	defer r.cond.L.Unlock()
-
 	for r.pendingReaders() {
 		for r.readAvailableShares(ctx, num) == 0 {
-			r.cond.Wait()
+			<-r.newData
 		}
 		if r.hasEnoughShares() {
-			out, err := r.scheme.Decode(p, r.inmap)
+			shares := make([]infectious.Share, 0, len(r.inmap))
+			for num, data := range r.inmap {
+				shares = append(shares, infectious.Share{
+					Number: num,
+					Data:   data,
+				})
+			}
+			out, err := r.scheme.Decode(p, shares)
 			if err != nil {
 				if r.shouldWaitForMore(err) {
 					continue
 				}
-				return nil, err
+				return nil, 0, err
 			}
-			return out, nil
+			return out, 1, nil
 		}
 	}
 	// could not read enough shares to attempt a decode
 	backcompatMon.Meter("download_stripe_failed_not_enough_pieces_uplink").Mark(1) //mon:locked
-	return nil, r.combineErrs(num)
+	return nil, 0, r.combineErrs(num)
 }
 
 // readAvailableShares reads the available num-th erasure shares from the piece
-// buffers without blocking. The return value n is the number of erasure shares
-// read.
-func (r *StripeReader) readAvailableShares(ctx context.Context, num int64) (n int) {
+// buffers without blocking. The return value changes is the number of new
+// erasure shares read or errored.
+func (r *StripeReader) readAvailableShares(ctx context.Context, num int64) (changes int) {
 	for i, buf := range r.bufs {
 		if r.inmap[i] != nil || r.errmap[i] != nil {
 			continue
@@ -135,6 +142,7 @@ func (r *StripeReader) readAvailableShares(ctx context.Context, num int64) (n in
 		hasShare, err := buf.HasShare(num)
 		if err != nil {
 			r.errmap[i] = err
+			changes++
 			continue
 		}
 		if hasShare {
@@ -144,10 +152,10 @@ func (r *StripeReader) readAvailableShares(ctx context.Context, num int64) (n in
 			} else {
 				r.inmap[i] = r.inbufs[i]
 			}
-			n++
+			changes++
 		}
 	}
-	return n
+	return changes
 }
 
 // pendingReaders checks if there are any pending readers to get a share from.

@@ -17,7 +17,8 @@ import (
 
 type hybridConnectorForcedKind struct{}
 
-func hyrbidConnectorContextWithForcedKind(ctx context.Context, kind string) context.Context {
+// WithForcedKind can force to use one specific type of connection (for example tcp or quic).
+func WithForcedKind(ctx context.Context, kind string) context.Context {
 	return context.WithValue(ctx, hybridConnectorForcedKind{}, kind)
 }
 
@@ -255,6 +256,22 @@ func (c HybridConnector) DialContextUnencrypted(ctx context.Context, address str
 		}
 		if entry, ok := entry.connector.(unencryptedConnector); ok {
 			return entry.DialContextUnencrypted(ctx, address)
+		}
+	}
+	return nil, Error.New("unable to do unencrypted dial")
+}
+
+// DialContextUnencryptedUnprefixed creates a raw connection using the first registered
+// connector that has a DialContextUnencryptedUnprefixed method. Unless the tcp connector
+// is unregistered, this will be the tcp connector.
+func (c HybridConnector) DialContextUnencryptedUnprefixed(ctx context.Context, address string) (net.Conn, error) {
+	forcedKind, _ := ctx.Value(hybridConnectorForcedKind{}).(string)
+	for _, entry := range c.connectors {
+		if forcedKind != "" && forcedKind != entry.name {
+			continue
+		}
+		if entry, ok := entry.connector.(unencryptedConnector); ok {
+			return entry.DialContextUnencryptedUnprefixed(ctx, address)
 		}
 	}
 	return nil, Error.New("unable to do unencrypted dial")

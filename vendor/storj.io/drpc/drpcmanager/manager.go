@@ -5,7 +5,12 @@ package drpcmanager
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/zeebo/errs"
@@ -27,8 +32,18 @@ type Options struct {
 	// flushing. Normal writes to streams typically issue a flush explicitly.
 	WriterBufferSize int
 
+	// Reader are passed to any readers the manager creates.
+	Reader drpcwire.ReaderOptions
+
 	// Stream are passed to any streams the manager creates.
 	Stream drpcstream.Options
+
+	// SoftCancel controls if a context cancel will cause the transport to be
+	// closed or, if true, a soft cancel message will be attempted if possible.
+	// A soft cancel can reduce the amount of closed and dialed connections at
+	// the potential cost of higher latencies if there is latent data still being
+	// flushed when the cancel happens.
+	SoftCancel bool
 
 	// InactivityTimeout is the amount of time the manager will wait when creating
 	// a NewServerStream. It only includes the time it is reading packets from the
@@ -51,7 +66,7 @@ type Manager struct {
 	sbuf    streamBuffer         // largest stream id created
 	pkts    chan drpcwire.Packet // channel for invoke packets
 	pdone   drpcsignal.Chan      // signals when a packets buffers can be reused
-	sterm   chan struct{}        // shared signal for stream terminated
+	sfin    chan struct{}        // shared signal for stream finished
 	streams chan streamInfo      // channel to signal that a stream should start
 
 	sigs struct {
@@ -78,11 +93,11 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
 	m := &Manager{
 		tr:   tr,
 		wr:   drpcwire.NewWriter(tr, opts.WriterBufferSize),
-		rd:   drpcwire.NewReader(tr),
+		rd:   drpcwire.NewReaderWithOptions(tr, opts.Reader),
 		opts: opts,
 
 		pkts:    make(chan drpcwire.Packet),
-		sterm:   make(chan struct{}, 1),
+		sfin:    make(chan struct{}, 1),
 		streams: make(chan streamInfo),
 	}
 
@@ -98,7 +113,7 @@ func NewWithOptions(tr drpc.Transport, opts Options) *Manager {
 
 	// set the internal stream options
 	drpcopts.SetStreamTransport(&m.opts.Stream.Internal, m.tr)
-	drpcopts.SetStreamTerm(&m.opts.Stream.Internal, m.sterm)
+	drpcopts.SetStreamFin(&m.opts.Stream.Internal, m.sfin)
 
 	go m.manageReader()
 	go m.manageStreams()
@@ -150,14 +165,17 @@ func (m *Manager) acquireSemaphore(ctx context.Context) error {
 // the manager is terminated.
 func (m *Manager) waitForPreviousStream(ctx context.Context) (err error) {
 	prev := m.sbuf.Get()
-
 	if prev == nil {
 		return nil
-	} else if err := prev.Close(); err != nil {
-		return err
-	} else if prev.IsFinished() {
+	}
+
+	// if the stream is not finished yet, we need to wait for it to be
+	// finished before letting the next stream to start.
+	if prev.IsFinished() {
 		return nil
 	}
+
+	m.log("WAIT", prev.String)
 
 	select {
 	case <-ctx.Done():
@@ -194,12 +212,30 @@ func (m *Manager) manageReader() {
 
 	var pkt drpcwire.Packet
 	var err error
+	var run int
 
 	for !m.sigs.term.IsSet() {
+		// if we have a run of "small" packets, drop the buffer to release
+		// memory so that a burst of large packets does not cause eternally
+		// large heap usage.
+		if run > 10 {
+			pkt.Data = nil
+			run = 0
+		}
+
 		pkt, err = m.rd.ReadPacketUsing(pkt.Data[:0])
 		if err != nil {
+			if isConnectionReset(err) {
+				err = drpc.ClosedError.Wrap(err)
+			}
 			m.terminate(managerClosed.Wrap(err))
 			return
+		}
+
+		if len(pkt.Data) < cap(pkt.Data)/4 {
+			run++
+		} else {
+			run = 0
 		}
 
 		m.log("READ", pkt.String)
@@ -252,8 +288,11 @@ func (m *Manager) manageReader() {
 //
 
 // newStream creates a stream value with the appropriate configuration for this manager.
-func (m *Manager) newStream(ctx context.Context, sid uint64) (*drpcstream.Stream, error) {
-	stream := drpcstream.NewWithOptions(ctx, sid, m.wr, m.opts.Stream)
+func (m *Manager) newStream(ctx context.Context, sid uint64, kind string) (*drpcstream.Stream, error) {
+	opts := m.opts.Stream
+	drpcopts.SetStreamKind(&opts.Internal, kind)
+
+	stream := drpcstream.NewWithOptions(ctx, sid, m.wr, opts)
 	select {
 	case m.streams <- streamInfo{ctx: ctx, stream: stream}:
 		m.sbuf.Set(stream)
@@ -284,27 +323,53 @@ func (m *Manager) manageStreams() {
 // manageStream watches the context and the stream and returns when the stream is
 // finished, canceling the stream if the context is canceled.
 func (m *Manager) manageStream(ctx context.Context, stream *drpcstream.Stream) {
-	defer m.sem.Recv()
-
 	select {
 	case <-m.sigs.term.Signal():
-		stream.Cancel(context.Canceled)
-		<-m.sterm
-		return
+		err := m.sigs.term.Err()
+		if errors.Is(err, io.EOF) {
+			err = context.Canceled
+		}
+		stream.Cancel(err)
+		<-m.sfin
+		m.sem.Recv()
 
-	case <-m.sterm:
-		return
+	case <-m.sfin:
+		m.sem.Recv()
 
 	case <-ctx.Done():
-		// If the stream isn't already finished, we have to terminate the transport
-		// to do an active cancel. If it is already finished, there is no need.
-		isFinished := stream.IsFinished()
-		stream.Cancel(ctx.Err())
-		if !isFinished {
-			m.log("UNFIN", stream.String)
-			m.terminate(ctx.Err())
+		m.log("CANCEL", stream.String)
+
+		if m.opts.SoftCancel {
+			// allow a new stream to begin.
+			m.sem.Recv()
+
+			// attempt to send the soft cancel. if it fails or if the stream is busy
+			// sending something else, then we have to hard cancel.
+			if busy, err := stream.SendCancel(ctx.Err()); err != nil {
+				m.terminate(err)
+			} else if busy {
+				m.terminate(ctx.Err())
+			}
+			stream.Cancel(ctx.Err())
+
+			// wait for the stream to signal that it is finished.
+			<-m.sfin
+		} else {
+			// If the stream isn't already finished, we have to terminate the transport
+			// to do an active cancel. If it is already finished, there is no need.
+			if !stream.Cancel(ctx.Err()) {
+				m.log("UNFIN", stream.String)
+				m.terminate(ctx.Err())
+			} else {
+				m.log("CLEAN", stream.String)
+			}
+
+			// wait for the stream to signal that it is finished.
+			<-m.sfin
+
+			// allow a new stream to begin.
+			m.sem.Recv()
 		}
-		<-m.sterm
 	}
 }
 
@@ -315,6 +380,17 @@ func (m *Manager) manageStream(ctx context.Context, stream *drpcstream.Stream) {
 // Closed returns a channel that is closed once the manager is closed.
 func (m *Manager) Closed() <-chan struct{} {
 	return m.sigs.term.Signal()
+}
+
+// Unblocked returns a channel that is closed when the manager is no longer blocked
+// from creating a new stream due to a previous stream's soft cancel. It should not
+// be called concurrently with NewClientStream or NewServerStream and the return
+// result is only valid until the next call to NewClientStream or NewServerStream.
+func (m *Manager) Unblocked() <-chan struct{} {
+	if prev := m.sbuf.Get(); prev != nil {
+		return prev.Context().Done()
+	}
+	return closedCh
 }
 
 // Close closes the transport the manager is using.
@@ -334,7 +410,7 @@ func (m *Manager) NewClientStream(ctx context.Context) (stream *drpcstream.Strea
 		return nil, err
 	}
 
-	return m.newStream(ctx, m.sbuf.Get().ID()+1)
+	return m.newStream(ctx, m.sbuf.Get().ID()+1, "cli")
 }
 
 // NewServerStream starts a stream on the managed transport for use by a server. It does
@@ -392,7 +468,7 @@ func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Strea
 					ctx = drpcmetadata.AddPairs(ctx, meta)
 				}
 
-				stream, err := m.newStream(ctx, pkt.ID.Stream)
+				stream, err := m.newStream(ctx, pkt.ID.Stream, "srv")
 				return stream, rpc, err
 
 			default:
@@ -401,4 +477,25 @@ func (m *Manager) NewServerStream(ctx context.Context) (stream *drpcstream.Strea
 			}
 		}
 	}
+}
+
+func isConnectionReset(err error) bool {
+	var operr *net.OpError
+	if !errors.As(err, &operr) {
+		return false
+	}
+	if errors.Is(operr.Err, syscall.ECONNRESET) {
+		return true
+	}
+	msg := strings.ToLower(operr.Err.Error())
+	if strings.Contains(msg, "connection reset by peer") {
+		return true
+	}
+	if strings.Contains(msg, "connection was forcibly closed by the remote host") {
+		return true
+	}
+	if strings.Contains(msg, strings.ToLower(syscall.ECONNRESET.Error())) {
+		return true
+	}
+	return false
 }
