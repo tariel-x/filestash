@@ -10,6 +10,7 @@ import (
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fs/operations"
+	"github.com/rclone/rclone/fs/sync"
 	"io"
 	"os"
 	"path"
@@ -199,6 +200,22 @@ func (r Rclone) rmFile(ctx context.Context, p string) error {
 func (r Rclone) Mv(from, to string) error {
 	ctx := context.Background()
 
+	isDir, err := r.isFile(ctx, from)
+	if err != nil {
+		return err
+	}
+
+	if !isDir {
+		return r.mvFile(ctx, from, to)
+	}
+
+	sync.MoveDir(ctx, nil, nil, false, false)
+
+	// TODO: use sync.MoveDir
+	return nil
+}
+
+func (r Rclone) mvFile(ctx context.Context, from, to string) error {
 	srcObj, err := r.fs.NewObject(ctx, from)
 	if err != nil {
 		return err
@@ -219,6 +236,10 @@ func (r Rclone) Mv(from, to string) error {
 
 func (r Rclone) Save(p string, content io.Reader) error {
 	ctx := context.Background()
+
+	// TODO: read by chunks, save big files on disk
+	// TODO: send by chunks
+
 	data, err := io.ReadAll(content)
 	if err != nil {
 		return err
