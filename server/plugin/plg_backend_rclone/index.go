@@ -13,6 +13,7 @@ import (
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fs/sync"
 	"io"
+	"log/slog"
 	"os"
 	"path"
 	"strings"
@@ -214,17 +215,71 @@ func (r Rclone) Mv(from, to string) error {
 func (r Rclone) Save(p string, content io.Reader) error {
 	ctx := context.Background()
 
-	// TODO: read by chunks, save big files on disk
-	// TODO: send by chunks
+	const (
+		kb        = 1 << 10
+		mb        = kb << 10
+		maxMemory = mb * 50
+	)
 
-	data, err := io.ReadAll(content)
+	data := make([]byte, maxMemory)
+	_, err := io.ReadAtLeast(content, data, maxMemory)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return err
+	}
+	dataReader := io.Reader(bytes.NewReader(data))
+	size := int64(len(data))
+
+	if err == nil {
+		written, f, saveErr := r.saveBuffer(content, data)
+		if saveErr != nil {
+			return saveErr
+		}
+		dataReader = f
+		size = int64(written)
+
+		defer func() {
+			if err := f.Close(); err != nil {
+				slog.Error("error closing temp file", "err", err)
+			}
+			if err := os.Remove(f.Name()); err != nil {
+				slog.Error("error removing temp file", "err", err)
+			}
+		}()
+	}
+
+	src := object.NewStaticObjectInfo(p, time.Now(), size, true, nil, r.fs)
+	obj, err := r.fs.Put(ctx, dataReader, src)
 	if err != nil {
 		return err
 	}
-	dataReader := bytes.NewReader(data)
-	src := object.NewStaticObjectInfo(p, time.Now(), int64(len(data)), true, nil, r.fs)
-	_, err = r.fs.Put(ctx, dataReader, src)
+	if size != obj.Size() {
+		return errors.New("size != obj size")
+	}
 	return err
+}
+
+func (r Rclone) saveBuffer(content io.Reader, data []byte) (int, *os.File, error) {
+	f, err := os.CreateTemp("", "filestash-rclone")
+	if err != nil {
+		return 0, nil, err
+	}
+
+	written, err := f.Write(data)
+	if err != nil {
+		return 0, nil, err
+	}
+	if written != len(data) {
+		return 0, nil, errors.New("written != data")
+	}
+
+	copied, err := io.Copy(f, content)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	_, err = f.Seek(0, 0)
+
+	return len(data) + int(copied), f, err
 }
 
 func (r Rclone) Touch(p string) error {
