@@ -6,6 +6,7 @@ import (
 	"errors"
 	. "github.com/mickael-kerjean/filestash/server/common"
 	_ "github.com/rclone/rclone/backend/all"
+	"github.com/rclone/rclone/cmd"
 	rcloneFs "github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/object"
@@ -23,16 +24,16 @@ func init() {
 }
 
 type Rclone struct {
-	fs      rcloneFs.Fs
-	storage *Storage
-	remote  string
+	fs     rcloneFs.Fs
+	conf   *Storage
+	remote string
 }
 
 func (r Rclone) Init(params map[string]string, app *App) (IBackend, error) {
 	p := struct {
 		config   string
 		password string
-		storage  string
+		remote   string
 	}{
 		params["config"],
 		params["password"],
@@ -41,20 +42,20 @@ func (r Rclone) Init(params map[string]string, app *App) (IBackend, error) {
 
 	ctx := context.Background()
 
-	s, err := NewStorage(p.config, p.password)
+	conf, err := NewStorage(p.config, p.password)
 	if err != nil {
 		return nil, err
 	}
-	config.SetData(s)
-	f, err := rcloneFs.NewFs(ctx, p.storage)
+	config.SetData(conf)
+	f, err := rcloneFs.NewFs(ctx, p.remote)
 	if err != nil {
 		return nil, err
 	}
 	// TODO: how to use connection cache?
 	return Rclone{
-		fs:      f,
-		storage: s,
-		remote:  p.storage,
+		fs:     f,
+		conf:   conf,
+		remote: p.remote,
 	}, nil
 }
 
@@ -200,38 +201,14 @@ func (r Rclone) rmFile(ctx context.Context, p string) error {
 func (r Rclone) Mv(from, to string) error {
 	ctx := context.Background()
 
-	isDir, err := r.isFile(ctx, from)
-	if err != nil {
-		return err
+	src := path.Join(strings.TrimRight(r.remote, "/"), strings.TrimLeft(from, "/")) + "/"
+	dest := path.Join(strings.TrimRight(r.remote, "/"), strings.TrimLeft(to, "/")) + "/"
+
+	fsrc, srcFileName, fdst := cmd.NewFsSrcFileDst([]string{src, dest})
+	if srcFileName == "" {
+		return sync.MoveDir(ctx, fdst, fsrc, true, true)
 	}
-
-	if !isDir {
-		return r.mvFile(ctx, from, to)
-	}
-
-	sync.MoveDir(ctx, nil, nil, false, false)
-
-	// TODO: use sync.MoveDir
-	return nil
-}
-
-func (r Rclone) mvFile(ctx context.Context, from, to string) error {
-	srcObj, err := r.fs.NewObject(ctx, from)
-	if err != nil {
-		return err
-	}
-	dataReader, err := srcObj.Open(ctx)
-	if err != nil {
-		return err
-	}
-
-	destObj := object.NewStaticObjectInfo(to, srcObj.ModTime(ctx), srcObj.Size(), true, nil, r.fs)
-	_, err = r.fs.Put(ctx, dataReader, destObj)
-	if err != nil {
-		return err
-	}
-
-	return srcObj.Remove(ctx)
+	return operations.MoveFile(ctx, fdst, fsrc, srcFileName, srcFileName)
 }
 
 func (r Rclone) Save(p string, content io.Reader) error {
