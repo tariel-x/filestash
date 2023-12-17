@@ -1,3 +1,6 @@
+//go:generate mockgen -destination mocks/mock_index.go github.com/rclone/rclone/fs Fs
+//go:generate mockgen -destination mocks/mock_index.go github.com/rclone/rclone/fs Fs
+
 package plg_backend_rclone
 
 import (
@@ -20,14 +23,21 @@ import (
 	"time"
 )
 
+const (
+	kb                = 1 << 10
+	mb                = kb << 10
+	maxInMemoryBuffer = mb * 50
+)
+
 func init() {
 	Backend.Register("rclone", Rclone{})
 }
 
 type Rclone struct {
-	fs     rcloneFs.Fs
-	conf   *Storage
-	remote string
+	fs                rcloneFs.Fs
+	conf              *Storage
+	remote            string
+	maxInMemoryBuffer int
 }
 
 func (r Rclone) Init(params map[string]string, app *App) (IBackend, error) {
@@ -38,7 +48,7 @@ func (r Rclone) Init(params map[string]string, app *App) (IBackend, error) {
 	}{
 		params["config"],
 		params["password"],
-		params["storage"],
+		params["remote"],
 	}
 
 	ctx := context.Background()
@@ -54,9 +64,10 @@ func (r Rclone) Init(params map[string]string, app *App) (IBackend, error) {
 	}
 	// TODO: how to use connection cache?
 	return Rclone{
-		fs:     f,
-		conf:   conf,
-		remote: p.remote,
+		fs:                f,
+		conf:              conf,
+		remote:            p.remote,
+		maxInMemoryBuffer: maxInMemoryBuffer,
 	}, nil
 }
 
@@ -82,10 +93,10 @@ func (r Rclone) LoginForm() Form {
 				Required:    true,
 			},
 			{
-				Name:        "storage",
+				Name:        "remote",
 				Type:        "text",
-				Placeholder: "Storage from the config",
-				Description: "Storage from the config",
+				Placeholder: "Remote from the config, e.g. `local:/`",
+				Description: "Remote from the config, e.g. `local:/`",
 			},
 		},
 	}
@@ -215,17 +226,12 @@ func (r Rclone) Mv(from, to string) error {
 func (r Rclone) Save(p string, content io.Reader) error {
 	ctx := context.Background()
 
-	const (
-		kb        = 1 << 10
-		mb        = kb << 10
-		maxMemory = mb * 50
-	)
-
-	data := make([]byte, maxMemory)
-	_, err := io.ReadAtLeast(content, data, maxMemory)
+	data := make([]byte, r.maxInMemoryBuffer)
+	readLength, err := io.ReadAtLeast(content, data, r.maxInMemoryBuffer)
 	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return err
 	}
+	data = data[:readLength]
 	dataReader := io.Reader(bytes.NewReader(data))
 	size := int64(len(data))
 
