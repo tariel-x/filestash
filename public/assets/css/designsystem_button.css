@@ -7,7 +7,7 @@ button {
   cursor: pointer;
   font-size: inherit;
   border-radius: 3px;
-  color: inherit;
+  color: rgba(0,0,0,0.6);
   background: inherit;
 }
 button.primary {
@@ -28,6 +28,9 @@ button.light {
 }
 button.large {
     width: 100%;
+}
+button[disabled] {
+    opacity: 0.9;
 }
 
 .touch-no button.dark:hover, .touch-no button.emphasis:hover, .touch-no button.primary:hover {
