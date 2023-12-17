@@ -37,7 +37,6 @@
 Differences from the [main Filestash version](https://github.com/mickael-kerjean/filestash):
 
 * Rclone plugin, enabling the use of any Rclone backend as a Filestash backend.
-* Adoption of go modules instead of vendor.
 
 # Features
 - Manage your files from a browser

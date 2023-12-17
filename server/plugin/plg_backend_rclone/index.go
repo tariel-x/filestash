@@ -1,5 +1,5 @@
-//go:generate mockgen -destination mocks/mock_index.go github.com/rclone/rclone/fs Fs
-//go:generate mockgen -destination mocks/mock_index.go github.com/rclone/rclone/fs Fs
+// mockgen -destination mocks/mock_index.go github.com/rclone/rclone/fs Fs
+// mockgen -destination mocks/mock_index.go github.com/rclone/rclone/fs Fs
 
 package plg_backend_rclone
 
