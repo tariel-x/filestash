@@ -26,13 +26,18 @@
     A Dropbox-like file manager that let you manage your data anywhere it is located:<br>
     <a href="https://www.filestash.app/ftp-client.html">FTP</a> • FTPS • <a href="https://www.filestash.app/ssh-file-transfer.html">SFTP</a> • <a href="https://www.filestash.app/webdav-client.html">WebDAV</a> • Git • <a href="https://www.filestash.app/s3-browser.html">S3</a> • NFS • Samba • Artifactory • <a href="https://www.filestash.app/ldap-browser.html">LDAP</a> • Mysql <br>
        Storj • CardDAV • CalDAV • Backblaze B2 • <a href="https://www.filestash.app/s3-browser.html">Minio</a> <br>
-               Dropbox • Google Drive
+               Dropbox • Google Drive • Any RClone backend
 </p>
 <p align="center">
     <a href="http://demo.filestash.app">
       <img src="https://raw.githubusercontent.com/mickael-kerjean/filestash_images/master/.assets/button_demo.png" alt="demo button" />
     </a>
 </p>
+
+Differences from the [main Filestash version](https://github.com/mickael-kerjean/filestash):
+
+* Rclone plugin, enabling the use of any Rclone backend as a Filestash backend.
+* Adoption of go modules instead of vendor.
 
 # Features
 - Manage your files from a browser
@@ -60,6 +65,7 @@
 - Quick access: frequently access folders are pin to the homepage
 - Emacs, VIM or Sublime keybindings `;)`
 - Search
+- RClone integration
 - .. and many more
 
 # Documentation
